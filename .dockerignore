@@ -1,0 +1,14 @@
+.git
+.idea
+.agents
+.aws
+.codex
+.env
+.env.*
+node_modules
+dist
+coverage
+backend
+*.log
+__pycache__
+*.py[cod]

@@ -1,0 +1,56 @@
+name: webflow-app
+
+services:
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-stride}
+      MYSQL_USER: ${MYSQL_USER:-stride}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-stride-local-password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-root-password}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  api:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: mysql+pymysql://${MYSQL_USER:-stride}:${MYSQL_PASSWORD:-stride-local-password}@db:3306/${MYSQL_DATABASE:-stride}
+      JWT_SECRET: ${JWT_SECRET:-replace-this-development-secret}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@webflow.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-Admin123!}
+      UPLOAD_DIR: /data/contracts
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - contracts_data:/data/contracts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+volumes:
+  mysql_data:
+    external: true
+    name: webflow_mysql_data
+  contracts_data:
+    external: true
+    name: webflow_contracts_data
