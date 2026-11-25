@@ -8,8 +8,14 @@ export async function workspaceRequest(path, options={}) {
   headers:{Authorization:`Bearer ${localStorage.getItem('stride_token')}`,'Content-Type':'application/json'},
   body:data===undefined?undefined:JSON.stringify(data)
  });
- const result=await response.json();
- if(!response.ok)throw new Error(typeof result.detail==='string'?result.detail:'The workspace could not complete the request.');
+ const body=await response.text();
+ let result;
+ try{result=body?JSON.parse(body):null}catch{result=null}
+ if(!response.ok){
+  const detail=typeof result?.detail==='string'?result.detail:`Request failed (${response.status}${response.statusText?` ${response.statusText}`:''}).`;
+  throw new Error(detail);
+ }
+ if(result===null)throw new Error('The workspace returned an invalid response. Please try again.');
  return result;
 }
 
