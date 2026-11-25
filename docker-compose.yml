@@ -26,6 +26,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-replace-this-development-secret}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@webflow.local}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-Admin123!}
+      WEBFLOW_DEMO_PASSWORD: ${WEBFLOW_DEMO_PASSWORD:-WebflowDemo123!}
       UPLOAD_DIR: /data/contracts
       CORS_ORIGINS: http://localhost:5173,http://localhost:8080
     depends_on:
@@ -43,7 +44,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "${WEBFLOW_WEB_BIND:-127.0.0.1}:8080:80"
     depends_on:
       api:
         condition: service_healthy

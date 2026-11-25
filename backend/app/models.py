@@ -8,13 +8,23 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(160))
     email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
+    username: Mapped[str | None] = mapped_column(String(160), unique=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(Enum("admin", "employee", "client", name="user_role"), default="employee")
     tags: Mapped[str] = mapped_column(String(500), default="")
     level: Mapped[int] = mapped_column(Integer, default=1)
     experience_points: Mapped[int] = mapped_column(Integer, default=0)
+    services_json: Mapped[str | None] = mapped_column(Text, nullable=True, default='[]')
+    portfolio_json: Mapped[str | None] = mapped_column(Text, nullable=True, default='[]')
+    profile_photo_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class UserTag(Base):
+    __tablename__ = "user_tags"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
 
 class Project(Base):
     __tablename__ = "projects"
@@ -30,6 +40,27 @@ class Project(Base):
     cancellation_status: Mapped[str] = mapped_column(String(40), default="none")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+class ProjectRequest(Base):
+    __tablename__ = "project_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    requested_owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    steps_json: Mapped[str] = mapped_column(Text, default="[]")
+    target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[str] = mapped_column(String(40), default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class ProjectRequestComment(Base):
+    __tablename__ = "project_request_comments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("project_requests.id", ondelete="CASCADE"), index=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 class Team(Base):
     __tablename__ = "teams"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -37,6 +68,7 @@ class Team(Base):
     name: Mapped[str] = mapped_column(String(120))
     scrum_master_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     discipline: Mapped[str] = mapped_column(String(80))
+    review_status: Mapped[str] = mapped_column(String(30), default="pending")
 
 class TeamMember(Base):
     __tablename__ = "team_members"
@@ -45,6 +77,17 @@ class TeamMember(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     invitation_status: Mapped[str] = mapped_column(String(30), default="pending")
     is_scrum_master: Mapped[bool] = mapped_column(Boolean, default=False)
+
+class EmployeeReview(Base):
+    __tablename__ = "employee_reviews"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
+    rating: Mapped[int] = mapped_column(Integer)
+    service: Mapped[str] = mapped_column(String(160), default="Overall")
+    comment: Mapped[str] = mapped_column(String(2000), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class Contract(Base):
     __tablename__ = "contracts"
@@ -65,6 +108,15 @@ class ContractSignature(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     signed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+class Sprint(Base):
+    __tablename__ = "sprints"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(30), default="planned")
+
 class Task(Base):
     __tablename__ = "tasks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -77,6 +129,7 @@ class Task(Base):
     complexity: Mapped[str] = mapped_column(String(20), default="standard")
     story_points: Mapped[int] = mapped_column(Integer, default=1)
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    sprint_id: Mapped[int | None] = mapped_column(ForeignKey("sprints.id", ondelete="SET NULL"), nullable=True)
     ai_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
