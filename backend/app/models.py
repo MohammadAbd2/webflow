@@ -9,6 +9,8 @@ class User(Base):
     name: Mapped[str] = mapped_column(String(160))
     email: Mapped[str] = mapped_column(String(254), unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(160), unique=True)
+    organization_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    phone_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(Enum("admin", "employee", "client", name="user_role"), default="employee")
     tags: Mapped[str] = mapped_column(String(500), default="")
@@ -38,6 +40,8 @@ class Project(Base):
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     setup_status: Mapped[str] = mapped_column(String(40), default="draft")
     cancellation_status: Mapped[str] = mapped_column(String(40), default="none")
+    completion_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class ProjectRequest(Base):
@@ -51,6 +55,7 @@ class ProjectRequest(Base):
     steps_json: Mapped[str] = mapped_column(Text, default="[]")
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="open")
+    status_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class ProjectRequestComment(Base):
@@ -60,6 +65,23 @@ class ProjectRequestComment(Base):
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class RosterTeam(Base):
+    __tablename__ = "roster_teams"
+    __table_args__ = (UniqueConstraint("owner_id", "name", name="uq_roster_owner_name"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+
+
+class RosterMember(Base):
+    __tablename__ = "roster_members"
+    __table_args__ = (UniqueConstraint("team_id", "user_id", name="uq_roster_team_user"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    team_id: Mapped[int] = mapped_column(ForeignKey("roster_teams.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+
 
 class Team(Base):
     __tablename__ = "teams"
@@ -130,6 +152,7 @@ class Task(Base):
     story_points: Mapped[int] = mapped_column(Integer, default=1)
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     sprint_id: Mapped[int | None] = mapped_column(ForeignKey("sprints.id", ondelete="SET NULL"), nullable=True)
+    completion_rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
     ai_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

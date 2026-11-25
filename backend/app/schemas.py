@@ -1,3 +1,4 @@
+from typing import Literal
 from datetime import date
 from pydantic import BaseModel, EmailStr, Field
 
@@ -16,6 +17,33 @@ class AccountUpdateIn(BaseModel):
     email: EmailStr
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str | None = Field(default=None, min_length=8, max_length=256)
+
+class ClientProfileIn(BaseModel):
+    organization_name: str = Field(default="", max_length=160)
+    phone_number: str = Field(default="", max_length=40)
+
+
+class AdminRequestChangeIn(BaseModel):
+    action: Literal["open", "taken", "approved", "completed", "delete"]
+    request_id: int | None = None
+    current_status: Literal["open", "taken", "approved", "completed"] | None = None
+    from_date: date | None = None
+    through_date: date | None = None
+
+
+class RosterTeamIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+
+
+class InviteEmployeesIn(BaseModel):
+    user_ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class ProjectCompletionIn(BaseModel):
+    action: Literal["complete", "reopen"]
+
+class AdminProjectStatusIn(BaseModel):
+    action: Literal["complete", "cancel", "reopen"]
 
 class ProjectStepIn(BaseModel):
     name: str = Field(min_length=2, max_length=120)
@@ -62,7 +90,13 @@ class TeamIn(BaseModel):
     name: str
     discipline: str
     scrum_master_id: int
-    member_ids: list[int] = []
+    member_ids: list[int] = Field(default_factory=list, max_length=100)
+    roster_team_ids: list[int] = Field(default_factory=list, max_length=30)
+
+class AdminProjectTeamIn(BaseModel):
+    scrum_master_id: int
+    member_ids: list[int] = Field(default_factory=list, max_length=100)
+
 
 class TeamBatchIn(BaseModel):
     teams: list[TeamIn] = Field(min_length=1, max_length=12)
@@ -96,6 +130,9 @@ class DecisionIn(BaseModel):
 
 class ContractReviewIn(BaseModel):
     approved: bool
+
+class ContractAdminSignaturesIn(BaseModel):
+    signed_by: list[Literal["client", "owner"]] = Field(max_length=2)
 
 class CancelIn(BaseModel):
     reason: str = Field(min_length=5)

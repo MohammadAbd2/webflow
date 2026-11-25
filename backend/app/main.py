@@ -1,17 +1,19 @@
+import asyncio
+import logging
 import os
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import select, func, inspect, text, or_
-from .db import Base, engine, get_db
-from .models import User, UserTag, Project, ProjectStep, Team, TeamMember, Sprint, Task, Contract, ContractSignature, CancellationRequest, ProjectRequest, ProjectRequestComment, EmployeeReview, Notification, Conversation, ConversationMember, Message
-from .schemas import RegisterIn, LoginIn, AccountUpdateIn, ProjectIn, ProjectStepIn, ProjectRequestIn, ProjectRequestCommentIn, EmployeeProfileIn, EmployeeReviewIn, EmployeeReviewUpdateIn, UserTagIn, UserRoleIn, TeamIn, TeamBatchIn, TeamReviewIn, TaskIn, SprintIn, TaskSprintIn, DecisionIn, ContractReviewIn, CancelIn, ConversationIn, MessageIn, NotificationReadIn, UserStatusIn
+from sqlalchemy import select, func, inspect, text, or_, delete
+from .db import Base, SessionLocal, engine, get_db
+from .models import User, UserTag, Project, ProjectStep, Team, TeamMember, Sprint, Task, Contract, ContractSignature, CancellationRequest, ProjectRequest, ProjectRequestComment, RosterTeam, RosterMember, EmployeeReview, Notification, Conversation, ConversationMember, Message
+from .schemas import RegisterIn, LoginIn, AccountUpdateIn, ProjectCompletionIn, AdminProjectStatusIn, ProjectIn, ProjectStepIn, ProjectRequestIn, ProjectRequestCommentIn, EmployeeProfileIn, EmployeeReviewIn, EmployeeReviewUpdateIn, UserTagIn, UserRoleIn, TeamIn, TeamBatchIn, TeamReviewIn, TaskIn, SprintIn, TaskSprintIn, DecisionIn, ContractReviewIn, ContractAdminSignaturesIn, CancelIn, ConversationIn, MessageIn, NotificationReadIn, UserStatusIn, ClientProfileIn, AdminRequestChangeIn, RosterTeamIn, InviteEmployeesIn, AdminProjectTeamIn
 from .security import hash_password, verify_password, issue_token, current_user, require_roles
 
 app = FastAPI(title="Webflow Project Hub API", version="1.0.0")
@@ -31,16 +33,34 @@ def startup():
         if "username" not in user_columns:
             connection.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(160) NULL"))
             connection.execute(text("CREATE UNIQUE INDEX ix_users_username ON users (username)"))
+        if "organization_name" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN organization_name VARCHAR(160) NULL"))
+        if "phone_number" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN phone_number VARCHAR(40) NULL"))
         if "services_json" not in user_columns: connection.execute(text("ALTER TABLE users ADD COLUMN services_json TEXT NULL"))
         if "portfolio_json" not in user_columns: connection.execute(text("ALTER TABLE users ADD COLUMN portfolio_json TEXT NULL"))
         if "profile_photo_url" not in user_columns: connection.execute(text("ALTER TABLE users ADD COLUMN profile_photo_url VARCHAR(1000) NULL"))
     review_columns = {column["name"] for column in inspect(engine).get_columns("employee_reviews")}
     if "service" not in review_columns:
         with engine.begin() as connection: connection.execute(text("ALTER TABLE employee_reviews ADD COLUMN service VARCHAR(160) NOT NULL DEFAULT 'Overall'"))
+    request_columns = {column["name"] for column in inspect(engine).get_columns("project_requests")}
+    if "status_changed_at" not in request_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE project_requests ADD COLUMN status_changed_at DATETIME NULL"))
+    project_columns = {column["name"] for column in inspect(engine).get_columns("projects")}
+    with engine.begin() as connection:
+        if "completion_due_at" not in project_columns:
+            connection.execute(text("ALTER TABLE projects ADD COLUMN completion_due_at DATETIME NULL"))
+        if "completed_at" not in project_columns:
+            connection.execute(text("ALTER TABLE projects ADD COLUMN completed_at DATETIME NULL"))
     task_columns = {column["name"] for column in inspect(engine).get_columns("tasks")}
     if "sprint_id" not in task_columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN sprint_id INTEGER NULL"))
+    if "completion_rewarded" not in task_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN completion_rewarded BOOLEAN NOT NULL DEFAULT FALSE"))
+            connection.execute(text("UPDATE tasks SET completion_rewarded = TRUE WHERE status = 'done'"))
     team_columns = {column["name"] for column in inspect(engine).get_columns("teams")}
     if "review_status" not in team_columns:
         with engine.begin() as connection:
@@ -48,24 +68,78 @@ def startup():
     admin_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL")
     admin_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD")
     if admin_email and admin_password:
-        from .db import SessionLocal
         with SessionLocal() as db:
             if not db.scalar(select(User).where(User.email == admin_email)):
                 db.add(User(name="Workspace Admin", email=admin_email, password_hash=hash_password(admin_password), role="admin"))
                 db.commit()
-    from .db import SessionLocal
     with SessionLocal() as db:
         if not db.scalar(select(UserTag.id).limit(1)):
             db.add_all([UserTag(key=key,name=name) for key,name in [("product_owner","Product owner"),("scrum_master","Scrum master"),("developer","Developer"),("designer","Designer"),("content","Content specialist"),("qa","Quality assurance")]])
             db.commit()
 
 def user_json(u):
-    return {"id":u.id,"name":u.name,"username":u.username,"email":u.email,"role":u.role,"active":u.active,"tags":u.tags.split(",") if u.tags else [],"level":u.level,"experience_points":u.experience_points,"services":json.loads(u.services_json or "[]"),"portfolio":json.loads(u.portfolio_json or "[]"),"profile_photo_url":u.profile_photo_url}
+    return {"id":u.id,"name":u.name,"username":u.username,"organization_name":u.organization_name,"email":u.email,"role":u.role,"active":u.active,"tags":u.tags.split(",") if u.tags else [],"level":u.level,"experience_points":u.experience_points,"services":json.loads(u.services_json or "[]"),"portfolio":json.loads(u.portfolio_json or "[]"),"profile_photo_url":u.profile_photo_url}
+
+def account_json(user):
+    return {**user_json(user), "phone_number": user.phone_number}
+
+def profile_photo_path(user_id: int) -> Path:
+    directory = UPLOAD_DIR / "profile_photos"
+    return directory / f"user_{user_id}"
+
+@app.post("/users/me/profile-photo")
+async def upload_profile_photo(file: UploadFile = File(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    allowed = {
+        "image/jpeg": (b"\xff\xd8\xff", ".jpg"),
+        "image/png": (b"\x89PNG\r\n\x1a\n", ".png"),
+        "image/gif": (b"GIF8", ".gif"),
+        "image/webp": (b"RIFF", ".webp"),
+    }
+    image = allowed.get(file.content_type or "")
+    if not image:
+        raise HTTPException(415, "Choose a JPEG, PNG, GIF, or WebP profile photo")
+    raw = await file.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(413, "Profile photos must be 5 MB or smaller")
+    signature, extension = image
+    valid_signature = raw.startswith(signature)
+    if file.content_type == "image/webp":
+        valid_signature = valid_signature and raw[8:12] == b"WEBP"
+    if not valid_signature:
+        raise HTTPException(415, "The uploaded file does not match its image format")
+    directory = profile_photo_path(user.id).parent
+    directory.mkdir(parents=True, exist_ok=True)
+    target = profile_photo_path(user.id).with_suffix(extension)
+    target.write_bytes(raw)
+    for old_extension in (".jpg", ".png", ".gif", ".webp"):
+        old_path = profile_photo_path(user.id).with_suffix(old_extension)
+        if old_path != target and old_path.exists():
+            old_path.unlink()
+    user.profile_photo_url = f"/api/profile-photos/{user.id}"
+    db.commit()
+    db.refresh(user)
+    return account_json(user)
+
+@app.get("/profile-photos/{user_id}")
+def get_profile_photo(user_id: int, db: Session = Depends(get_db)):
+    user = db.get(User, user_id)
+    if not user or not user.profile_photo_url:
+        raise HTTPException(404, "Profile photo not found")
+    photo = next((profile_photo_path(user_id).with_suffix(ext) for ext in (".jpg", ".png", ".gif", ".webp") if profile_photo_path(user_id).with_suffix(ext).is_file()), None)
+    if not photo:
+        raise HTTPException(404, "Profile photo not found")
+    media_type = {".jpg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp"}[photo.suffix]
+    return FileResponse(photo, media_type=media_type, headers={"Cache-Control": "no-cache"})
+
+
+def client_label(user):
+    return (user.organization_name or user.name) if user else None
+
 
 def project_json(p, db=None):
     client = db.get(User, p.client_id) if db else None
     owner = db.get(User, p.owner_id) if db else None
-    return {"id":p.id,"name":p.name,"description":p.description,"client_id":p.client_id,"client_name":client.name if client else None,"owner_id":p.owner_id,"owner_name":owner.name if owner else None,"stage":p.stage,"progress":p.progress,"target_date":p.target_date,"setup_status":p.setup_status,"cancellation_status":p.cancellation_status}
+    return {"id":p.id,"name":p.name,"description":p.description,"client_id":p.client_id,"client_name":client_label(client),"owner_id":p.owner_id,"owner_name":owner.name if owner else None,"stage":p.stage,"progress":100 if p.completed_at else p.progress,"target_date":p.target_date,"setup_status":p.setup_status,"cancellation_status":p.cancellation_status,"completion_due_at":utc_iso(p.completion_due_at),"completed_at":utc_iso(p.completed_at)}
 
 def task_json(t):
     return {"id":t.id,"project_id":t.project_id,"team_id":t.team_id,"title":t.title,"description":t.description,"status":t.status,"priority":t.priority,"complexity":t.complexity,"story_points":t.story_points,"assignee_id":t.assignee_id,"sprint_id":t.sprint_id,"ai_generated":t.ai_generated,"due_date":t.due_date}
@@ -91,7 +165,7 @@ def register(data: RegisterIn, db: Session=Depends(get_db)):
         raise HTTPException(409, "An account with this email already exists")
     user=User(name=data.name,email=str(data.email).lower(),password_hash=hash_password(data.password),role=data.role)
     db.add(user); db.commit(); db.refresh(user)
-    return {"access_token":issue_token(user),"token_type":"bearer","user":user_json(user)}
+    return {"access_token":issue_token(user),"token_type":"bearer","user":account_json(user)}
 
 @app.post("/auth/login")
 def login(data: LoginIn, db: Session=Depends(get_db)):
@@ -107,10 +181,10 @@ def login(data: LoginIn, db: Session=Depends(get_db)):
         raise HTTPException(403,"This account is suspended. Contact workspace support.")
     add_notification(db,user.id,"security","New sign-in","A new sign-in to your Webflow account was successful.")
     db.commit()
-    return {"access_token":issue_token(user),"token_type":"bearer","user":user_json(user)}
+    return {"access_token":issue_token(user),"token_type":"bearer","user":account_json(user)}
 
 @app.get("/auth/me")
-def me(user: User=Depends(current_user)): return user_json(user)
+def me(user: User=Depends(current_user)): return account_json(user)
 
 @app.patch("/auth/me")
 def update_account(data: AccountUpdateIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
@@ -136,7 +210,15 @@ def update_account(data: AccountUpdateIn, db: Session = Depends(get_db), user: U
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "That username or email is already in use")
-    return user_json(user)
+    return account_json(user)
+
+@app.patch("/auth/client-profile")
+def update_client_profile(data: ClientProfileIn, db: Session = Depends(get_db), client: User = Depends(require_roles("client"))):
+    client.organization_name = data.organization_name.strip() or None
+    client.phone_number = data.phone_number.strip() or None
+    db.commit()
+    return account_json(client)
+
 
 @app.get("/users")
 def users(q:str="",role:str="",limit:int=30,offset:int=0,db: Session=Depends(get_db), user: User=Depends(current_user)):
@@ -198,31 +280,57 @@ def update_employee_profile(data:EmployeeProfileIn,db:Session=Depends(get_db),em
     return user_json(employee)
 
 @app.post("/employees/{employee_id}/reviews",status_code=201)
-def review_employee(employee_id:int,data:EmployeeReviewIn,db:Session=Depends(get_db),client:User=Depends(require_roles("client"))):
+def review_employee(employee_id:int,data:EmployeeReviewIn,db:Session=Depends(get_db),reviewer:User=Depends(current_user)):
     employee=db.get(User,employee_id)
     if not employee or employee.role!="employee" or not employee.active: raise HTTPException(404,"Employee not found")
     project=db.get(Project,data.project_id)
-    if not project or project.client_id!=client.id: raise HTTPException(404,"Project not found")
-    if project.progress < 100: raise HTTPException(409,"Service reviews open after the project is complete")
-    service_name=data.service.strip()
-    services=json.loads(employee.services_json or "[]")
-    if service_name!="Overall" and service_name not in services: raise HTTPException(400,"Choose a service listed on this employee's profile")
-    assigned=project.owner_id==employee.id or db.scalar(select(TeamMember.id).join(Team).where(Team.project_id==project.id,TeamMember.user_id==employee.id,TeamMember.invitation_status=="accepted")) is not None
-    if not assigned: raise HTTPException(403,"You can only review a member of your project")
-    review=db.scalar(select(EmployeeReview).where(EmployeeReview.employee_id==employee.id,EmployeeReview.client_id==client.id,EmployeeReview.project_id==project.id,EmployeeReview.service==service_name))
+    if not project: raise HTTPException(404,"Project not found")
+    if not project.completed_at: raise HTTPException(409,"Service reviews open after the project is complete")
+    eligible_targets=set()
+    if reviewer.role=="client" and project.client_id==reviewer.id:
+        eligible_targets.add(project.owner_id)
+    if reviewer.role=="employee" and is_tagged(reviewer,"product_owner") and project.owner_id==reviewer.id:
+        eligible_targets.update(db.scalars(select(Team.scrum_master_id).where(Team.project_id==project.id)).all())
+    if reviewer.role=="employee" and is_tagged(reviewer,"scrum_master"):
+        led_team_ids=select(Team.id).where(Team.project_id==project.id,Team.scrum_master_id==reviewer.id)
+        eligible_targets.update(db.scalars(select(TeamMember.user_id).where(
+            TeamMember.team_id.in_(led_team_ids),TeamMember.invitation_status=="accepted",
+            TeamMember.is_scrum_master.is_(False))).all())
+    eligible_targets.discard(reviewer.id)
+    if employee_id not in eligible_targets:
+        raise HTTPException(403,"You can only review the project owner, assigned scrum masters, or accepted members of teams you lead")
+    service_name="Overall"
+    review=db.scalar(select(EmployeeReview).where(EmployeeReview.employee_id==employee.id,EmployeeReview.client_id==reviewer.id,EmployeeReview.project_id==project.id,EmployeeReview.service==service_name))
     if review:
         review.rating=data.rating;review.service=service_name;review.comment=data.comment.strip()
     else:
-        review=EmployeeReview(employee_id=employee.id,client_id=client.id,project_id=project.id,rating=data.rating,service=service_name,comment=data.comment.strip());db.add(review)
+        review=EmployeeReview(employee_id=employee.id,client_id=reviewer.id,project_id=project.id,rating=data.rating,service=service_name,comment=data.comment.strip());db.add(review)
+    add_notification(db,employee.id,"project","New project review",f"{reviewer.name} rated your work on {project.name}: {data.rating}/5.",f"/projects/{project.id}")
     db.commit();db.refresh(review)
-    return {"id":review.id,"rating":review.rating,"service":review.service,"comment":review.comment,"created_at":review.created_at}
+    return project_review_json(db,review)
 
 @app.get("/employees/{employee_id}/reviews")
 def employee_reviews(employee_id:int,db:Session=Depends(get_db),viewer:User=Depends(current_user)):
     employee=db.get(User,employee_id)
     if not employee or employee.role!="employee": raise HTTPException(404,"Employee not found")
     rows=db.scalars(select(EmployeeReview).where(EmployeeReview.employee_id==employee_id).order_by(EmployeeReview.created_at.desc())).all()
-    return [{"id":row.id,"rating":row.rating,"service":row.service,"comment":row.comment,"client_name":db.get(User,row.client_id).name,"project_name":db.get(Project,row.project_id).name,"project_id":row.project_id,"created_at":row.created_at} for row in rows]
+    return [project_review_json(db,row) for row in rows]
+
+def project_review_json(db:Session,row:EmployeeReview):
+    reviewer=db.get(User,row.client_id)
+    return {"id":row.id,"employee_id":row.employee_id,"rating":row.rating,"service":row.service,
+            "comment":row.comment,"reviewer_id":row.client_id,"reviewer_name":reviewer.name,
+            "reviewer_role":reviewer.role,"client_name":reviewer.name,
+            "project_name":db.get(Project,row.project_id).name,"project_id":row.project_id,
+            "created_at":row.created_at}
+
+@app.get("/projects/{project_id}/reviews")
+def project_reviews(project_id:int,db:Session=Depends(get_db),viewer:User=Depends(current_user)):
+    project=db.get(Project,project_id)
+    if not project: raise HTTPException(404,"Project not found")
+    if not can_view_project(db,project,viewer): raise HTTPException(403,"Not a member of this project")
+    rows=db.scalars(select(EmployeeReview).where(EmployeeReview.project_id==project_id).order_by(EmployeeReview.created_at.desc())).all()
+    return [project_review_json(db,row) for row in rows]
 
 @app.patch("/admin/reviews/{review_id}")
 def update_employee_review(review_id:int,data:EmployeeReviewUpdateIn,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
@@ -240,7 +348,12 @@ def delete_employee_review(review_id:int,db:Session=Depends(get_db),admin:User=D
 @app.get("/admin/reviews")
 def admin_employee_reviews(db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
     rows=db.scalars(select(EmployeeReview).order_by(EmployeeReview.created_at.desc()).limit(200)).all()
-    return [{"id":row.id,"employee_id":row.employee_id,"employee_name":db.get(User,row.employee_id).name,"client_id":row.client_id,"client_name":db.get(User,row.client_id).name,"project_id":row.project_id,"project_name":db.get(Project,row.project_id).name,"service":row.service,"rating":row.rating,"comment":row.comment,"created_at":row.created_at} for row in rows]
+    return [{"id":row.id,"employee_id":row.employee_id,"employee_name":db.get(User,row.employee_id).name,
+             "client_id":row.client_id,"client_name":db.get(User,row.client_id).name,
+             "reviewer_id":row.client_id,"reviewer_name":db.get(User,row.client_id).name,
+             "reviewer_role":db.get(User,row.client_id).role,"project_id":row.project_id,
+             "project_name":db.get(Project,row.project_id).name,"service":row.service,
+             "rating":row.rating,"comment":row.comment,"created_at":row.created_at} for row in rows]
 
 @app.patch("/users/{user_id}/tags")
 def set_tags(user_id: int, tags: list[str], db: Session=Depends(get_db), admin: User=Depends(require_roles("admin"))):
@@ -249,8 +362,130 @@ def set_tags(user_id: int, tags: list[str], db: Session=Depends(get_db), admin: 
     selected=list(dict.fromkeys(t.strip() for t in tags if t.strip()))
     known=set(db.scalars(select(UserTag.key)).all())
     if any(tag not in known for tag in selected): raise HTTPException(400,"Choose tags from the workspace tag list")
-    user.tags=",".join(selected); db.commit()
+    previous = set((user.tags or "").split(",")) - {""}
+    if previous != set(selected):
+        user.tags = ",".join(selected)
+        add_notification(db, user.id, "security", "Your role tags changed",
+                         "Current tags: " + (", ".join(selected).replace("_", " ") or "None"), "Settings")
+    db.commit()
     return user_json(user)
+
+def utc_iso(value: datetime | None):
+    return value.replace(tzinfo=timezone.utc).isoformat() if value else None
+
+
+def notify_project_status(db: Session, project: Project, title: str, detail: str):
+    member_ids = select(TeamMember.user_id).join(Team).where(
+        Team.project_id == project.id, TeamMember.invitation_status == "accepted"
+    )
+    recipients = db.scalars(select(User.id).where(
+        User.active.is_(True),
+        or_(User.id.in_([project.client_id, project.owner_id]), User.id.in_(member_ids)),
+    ))
+    for user_id in recipients:
+        add_notification(db, user_id, "project", title, f"{project.name}: {detail}", f"/projects/{project.id}")
+
+
+def finalize_project(db: Session, project: Project, now: datetime, detail: str):
+    project.completed_at = now
+    project.completion_due_at = None
+    sync_request_status(db, project.id, "completed")
+    notify_project_status(db, project, "Project completed", detail)
+
+
+def finalize_expired_projects():
+    now = datetime.utcnow()
+    with SessionLocal() as db:
+        due_projects = db.scalars(select(Project).where(
+            Project.completion_due_at <= now, Project.completed_at.is_(None),
+            Project.cancellation_status != "approved",
+        ).order_by(Project.id).with_for_update()).all()
+        for project in due_projects:
+            finalize_project(db, project, now, "Completed automatically after 14 days awaiting client confirmation.")
+        db.commit()
+
+
+async def project_completion_worker():
+    while True:
+        try:
+            await asyncio.to_thread(finalize_expired_projects)
+        except Exception:
+            logging.getLogger(__name__).exception("Could not finalize overdue projects")
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def start_completion_worker():
+    app.state.completion_worker = asyncio.create_task(project_completion_worker())
+
+
+@app.on_event("shutdown")
+async def stop_completion_worker():
+    app.state.completion_worker.cancel()
+    await asyncio.gather(app.state.completion_worker, return_exceptions=True)
+
+
+@app.patch("/projects/{project_id}/completion")
+def update_project_completion(
+    project_id: int, data: ProjectCompletionIn,
+    db: Session = Depends(get_db), user: User = Depends(current_user),
+):
+    project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if not project:
+        raise HTTPException(404, "Project not found")
+    owner = user.role == "employee" and user.id == project.owner_id
+    client = user.role == "client" and user.id == project.client_id
+    admin = user.role == "admin"
+    if not (owner or client or admin):
+        raise HTTPException(403, "Only the project owner, client, or an admin can change completion")
+    if project.cancellation_status == "approved":
+        raise HTTPException(409, "This project has been cancelled")
+    now = datetime.utcnow()
+    if data.action == "reopen":
+        if project.completed_at or project.completion_due_at:
+            if project.completed_at:
+                sync_request_status(db, project.id, "approved", from_status="completed")
+            project.completed_at = None
+            project.completion_due_at = None
+            notify_project_status(db, project, "Project reopened", f"{user.name} reopened this project.")
+    elif client:
+        if not project.completed_at:
+            if not project.completion_due_at:
+                raise HTTPException(409, "Wait for the project owner or an admin to submit the project for completion")
+            finalize_project(db, project, now, f"{user.name} confirmed completion.")
+    elif not project.completed_at and not project.completion_due_at:
+        project.completion_due_at = now + timedelta(days=14)
+        notify_project_status(db, project, "Project awaiting completion confirmation",
+                              f"{user.name} marked this project complete. The client has 14 days to review.")
+    db.commit()
+    return project_json(project, db)
+
+@app.patch("/admin/projects/{project_id}/status")
+def update_admin_project_status(
+    project_id: int, data: AdminProjectStatusIn,
+    db: Session = Depends(get_db), admin: User = Depends(require_roles("admin")),
+):
+    project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if not project:
+        raise HTTPException(404, "Project not found")
+    now = datetime.utcnow()
+    if data.action == "complete":
+        project.cancellation_status = "none"
+        finalize_project(db, project, now, "An administrator marked this project complete.")
+    elif data.action == "cancel":
+        project.completed_at = None
+        project.completion_due_at = None
+        project.cancellation_status = "approved"
+        notify_project_status(db, project, "Project cancelled", "An administrator cancelled this project.")
+    else:
+        project.completed_at = None
+        project.completion_due_at = None
+        project.cancellation_status = "none"
+        sync_request_status(db, project.id, "approved", from_status="completed")
+        notify_project_status(db, project, "Project reopened", "An administrator reopened this project.")
+    db.commit()
+    return project_json(project, db)
+
 
 @app.get("/projects")
 def list_projects(db: Session=Depends(get_db), user: User=Depends(current_user)):
@@ -283,7 +518,57 @@ def request_json(db:Session,row:ProjectRequest):
     client=db.get(User,row.client_id)
     owner=db.get(User,row.requested_owner_id) if row.requested_owner_id else None
     comments=db.scalars(select(ProjectRequestComment).where(ProjectRequestComment.request_id==row.id).order_by(ProjectRequestComment.created_at)).all()
-    return {"id":row.id,"client_id":row.client_id,"client_name":client.name if client else "Client","requested_owner_id":row.requested_owner_id,"requested_owner_name":owner.name if owner else None,"project_id":row.project_id,"name":row.name,"description":row.description,"steps":json.loads(row.steps_json or "[]"),"target_date":row.target_date,"status":row.status,"created_at":row.created_at,"comments":[{"id":c.id,"sender_id":c.sender_id,"sender_name":db.get(User,c.sender_id).name,"body":c.body,"created_at":c.created_at} for c in comments]}
+    return {"id":row.id,"client_id":row.client_id,"client_name":client_label(client) or "Client","requested_owner_id":row.requested_owner_id,"requested_owner_name":owner.name if owner else None,"project_id":row.project_id,"name":row.name,"description":row.description,"steps":json.loads(row.steps_json or "[]"),"target_date":row.target_date,"status":"taken" if row.status=="owner_selected" else row.status,"status_changed_at":utc_iso(row.status_changed_at or row.created_at),"created_at":utc_iso(row.created_at),"comments":[{"id":c.id,"sender_id":c.sender_id,"sender_name":db.get(User,c.sender_id).name,"body":c.body,"created_at":c.created_at} for c in comments]}
+
+def active_admin_ids(db: Session):
+    return db.scalars(select(User.id).where(User.role == "admin", User.active.is_(True))).all()
+
+
+def set_request_status(row: ProjectRequest, status: str):
+    if row.status != status:
+        row.status = status
+        row.status_changed_at = datetime.utcnow()
+
+
+def sync_request_status(db: Session, project_id: int, status: str, from_status: str | None = None):
+    query = select(ProjectRequest).where(ProjectRequest.project_id == project_id)
+    if from_status:
+        query = query.where(ProjectRequest.status == from_status)
+    for row in db.scalars(query.with_for_update()):
+        set_request_status(row, status)
+
+
+@app.patch("/admin/project-requests")
+def manage_project_requests(data: AdminRequestChangeIn, db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):
+    query = select(ProjectRequest)
+    if data.request_id is not None:
+        query = query.where(ProjectRequest.id == data.request_id)
+    else:
+        if not data.current_status or not data.from_date or not data.through_date:
+            raise HTTPException(422, "Choose a current status and both dates for bulk changes")
+        if data.through_date < data.from_date:
+            raise HTTPException(422, "End date must be on or after start date")
+        statuses = ["taken", "owner_selected"] if data.current_status == "taken" else [data.current_status]
+        changed_at = func.coalesce(ProjectRequest.status_changed_at, ProjectRequest.created_at)
+        query = query.where(ProjectRequest.status.in_(statuses),
+                            changed_at >= datetime.combine(data.from_date, datetime.min.time()),
+                            changed_at <= datetime.combine(data.through_date, datetime.max.time()))
+    rows = db.scalars(query.order_by(ProjectRequest.id).with_for_update()).all()
+    if data.request_id is not None and not rows:
+        raise HTTPException(404, "Project request not found")
+    changed_ids = []
+    for row in rows:
+        if data.action == "delete":
+            db.execute(delete(ProjectRequestComment).where(ProjectRequestComment.request_id == row.id))
+            db.delete(row)
+        elif row.status != data.action:
+            set_request_status(row, data.action)
+        else:
+            continue
+        changed_ids.append(row.id)
+    db.commit()
+    return {"affected": len(changed_ids), "ids": changed_ids}
+
 
 @app.get("/project-requests")
 def list_project_requests(db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -311,6 +596,8 @@ def create_project_request(data:ProjectRequestIn,db:Session=Depends(get_db),clie
     for recipient in recipients:
         if "product_owner" in (recipient.tags or "").split(","):
             add_notification(db,recipient.id,"project","New client project request",row.name,"/project-requests")
+    for admin_id in active_admin_ids(db):
+        add_notification(db, admin_id, "project", "New client project request", row.name, "/project-requests")
     db.commit();db.refresh(row)
     return request_json(db,row)
 
@@ -331,16 +618,16 @@ def add_project_request_comment(request_id:int,data:ProjectRequestCommentIn,db:S
 
 @app.post("/project-requests/{request_id}/accept")
 def accept_project_request(request_id:int,db:Session=Depends(get_db),owner:User=Depends(require_roles("employee"))):
-    row=db.get(ProjectRequest,request_id)
+    row=db.scalar(select(ProjectRequest).where(ProjectRequest.id==request_id).with_for_update())
     if not row: raise HTTPException(404,"Project request not found")
     if "product_owner" not in (owner.tags or "").split(","): raise HTTPException(403,"Only tagged product owners can accept client requests")
     if row.requested_owner_id and row.requested_owner_id!=owner.id: raise HTTPException(403,"This request is assigned to another product owner")
-    if row.status!="open": raise HTTPException(409,"This request has already been accepted")
+    if row.status!="open" or row.project_id: raise HTTPException(409,"This request is not available for acceptance")
     project=Project(name=row.name,description=row.description,client_id=row.client_id,owner_id=owner.id,target_date=row.target_date,setup_status="draft")
     db.add(project);db.flush()
     steps=json.loads(row.steps_json or "[]") or [{"name":"Design","description":""},{"name":"Development","description":""},{"name":"Optimisation & launch","description":""}]
     for position,step in enumerate(steps): db.add(ProjectStep(project_id=project.id,name=step["name"].strip(),description=step.get("description", ""),position=position))
-    row.requested_owner_id=owner.id;row.project_id=project.id;row.status="owner_selected"
+    row.requested_owner_id=owner.id;row.project_id=project.id;set_request_status(row,"taken")
     add_notification(db,row.client_id,"project","Product owner accepted your request",f"{project.name} · {owner.name} will prepare the team plan.",f"/projects/{project.id}")
     db.commit();db.refresh(row)
     return {"request":request_json(db,row),"project":project_json(project,db)}
@@ -419,12 +706,15 @@ def update_user_status(user_id:int,data:UserStatusIn,db:Session=Depends(get_db),
     db.commit(); return {"id":target.id,"active":target.active}
 
 @app.get("/admin/users")
-def admin_users(q:str="",role:str="",limit:int=50,offset:int=0,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
+def admin_users(q:str="",role:str="",limit:int=25,offset:int=0,include_total:bool=False,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
     query=select(User)
     if role in {"admin","employee","client"}: query=query.where(User.role==role)
     if q.strip():
         term=q.strip();query=query.where(or_(func.lower(User.name).contains(term.lower()),func.lower(User.email).contains(term.lower()),User.id==int(term) if term.isdigit() else text("0=1")))
-    return [user_json(row) for row in db.scalars(query.order_by(User.name).offset(max(offset,0)).limit(min(max(limit,1),100))).all()]
+    items = [account_json(row) for row in db.scalars(query.order_by(User.name, User.id).offset(max(offset,0)).limit(min(max(limit,1),25))).all()]
+    if include_total:
+        return {"items": items, "total": db.scalar(select(func.count()).select_from(query.subquery()))}
+    return items
 
 @app.patch("/admin/users/{user_id}/role")
 def update_user_role(user_id:int,data:UserRoleIn,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
@@ -433,8 +723,12 @@ def update_user_role(user_id:int,data:UserRoleIn,db:Session=Depends(get_db),admi
     if not target: raise HTTPException(404,"User not found")
     if target.id==admin.id and data.role!="admin": raise HTTPException(400,"You cannot change your own administrator role")
     if target.role=="admin" and data.role!="admin" and db.scalar(select(func.count(User.id)).where(User.role=="admin",User.active.is_(True)))<=1: raise HTTPException(409,"Keep at least one active administrator")
-    target.role=data.role
-    if data.role!="employee": target.tags=""
+    if target.role != data.role:
+        target.role = data.role
+        if data.role != "employee":
+            target.tags = ""
+        add_notification(db, target.id, "security", "Your account role changed",
+                         f"Your new account role is {data.role}.", "Settings")
     db.commit();return user_json(target)
 
 @app.get("/admin/tags")
@@ -463,14 +757,19 @@ def rename_workspace_tag(tag_id:int,data:UserTagIn,db:Session=Depends(get_db),ad
     old=tag.key;tag.key=key;tag.name=data.name.strip()
     for user in db.scalars(select(User).where(User.tags.contains(old))).all():
         values=[key if value==old else value for value in user.tags.split(",") if value]
-        user.tags=",".join(dict.fromkeys(values))
+        if old in user.tags.split(","):
+            user.tags=",".join(dict.fromkeys(values))
+            add_notification(db, user.id, "security", "A role tag was renamed", tag.name, "Settings")
     db.commit();return {"id":tag.id,"key":tag.key,"name":tag.name}
 
 @app.delete("/admin/tags/{tag_id}")
 def delete_workspace_tag(tag_id:int,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
     tag=db.get(UserTag,tag_id)
     if not tag: raise HTTPException(404,"Tag not found")
-    for user in db.scalars(select(User).where(User.tags.contains(tag.key))).all(): user.tags=",".join(value for value in user.tags.split(",") if value and value!=tag.key)
+    for user in db.scalars(select(User).where(User.tags.contains(tag.key))).all():
+        if tag.key in user.tags.split(","):
+            user.tags = ",".join(value for value in user.tags.split(",") if value and value != tag.key)
+            add_notification(db, user.id, "security", "A role tag was removed", tag.name, "Settings")
     db.delete(tag);db.commit();return {"deleted":True,"id":tag_id}
 
 def conversation_member(db:Session,conversation_id:int,user_id:int):
@@ -562,54 +861,241 @@ def send_message(conversation_id:int,data:MessageIn,db:Session=Depends(get_db),u
     db.commit(); db.refresh(message)
     return message_json(message,user.id)
 
-@app.post("/projects/{project_id}/teams/batch",status_code=201)
-def add_project_teams(project_id:int,data:TeamBatchIn,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
-    project=db.get(Project,project_id)
-    if not project: raise HTTPException(404,"Project not found")
-    if user.role=="employee" and (project.owner_id!=user.id or "product_owner" not in (user.tags or "").split(",")): raise HTTPException(403,"Only the tagged project owner can propose teams")
-    names=[item.name.strip().casefold() for item in data.teams]
-    if any(not name for name in names) or len(names)!=len(set(names)): raise HTTPException(400,"Team names must be unique and non-empty")
-    prepared=[]
-    for item in data.teams:
-        lead=db.get(User,item.scrum_master_id)
-        if not lead or lead.role!="employee" or not lead.active or "scrum_master" not in (lead.tags or "").split(","): raise HTTPException(400,"Each team needs an active employee tagged as its scrum master")
-        members=set(item.member_ids+[lead.id]);users={member_id:db.get(User,member_id) for member_id in members}
-        if any(not member or member.role!="employee" or not member.active for member in users.values()): raise HTTPException(400,"Team members must be active employee accounts")
-        prepared.append((item,lead,members))
-    created=[]
-    for item,lead,members in prepared:
-        team=Team(project_id=project.id,name=item.name.strip(),discipline=item.discipline.strip(),scrum_master_id=lead.id,review_status="pending")
-        db.add(team);db.flush()
-        for member_id in members: db.add(TeamMember(team_id=team.id,user_id=member_id,invitation_status="pending",is_scrum_master=member_id==lead.id))
-        add_notification(db,lead.id,"project","Review your proposed team",f"{team.name} · {project.name}",f"/teams/{team.id}/review")
-        created.append(team)
-    project.setup_status="pending_team_review"
-    for admin in db.scalars(select(User).where(User.role=="admin",User.active.is_(True))).all(): add_notification(db,admin.id,"project","Project team proposal created",f"{project.name} is awaiting scrum master review.","/admin/projects/pending")
-    db.commit()
-    return [{"id":team.id,"project_id":project.id,"name":team.name,"discipline":team.discipline,"scrum_master_id":team.scrum_master_id,"review_status":team.review_status} for team in created]
+def is_tagged(user: User | None, tag: str):
+    return bool(user and user.active and user.role == "employee" and tag in (user.tags or "").split(","))
 
-@app.post("/projects/{project_id}/teams",status_code=201)
-def add_team(project_id: int,data: TeamIn,db: Session=Depends(get_db),user: User=Depends(require_roles("admin","employee"))):
-    project=db.get(Project,project_id)
-    if not project: raise HTTPException(404,"Project not found")
-    if user.role=="employee" and (project.owner_id!=user.id or "product_owner" not in (user.tags or "").split(",")): raise HTTPException(403,"Only the tagged project owner can propose teams")
-    scrum_master=db.get(User,data.scrum_master_id)
-    if not scrum_master: raise HTTPException(404,"Scrum master not found")
-    if scrum_master.role!="employee" or "scrum_master" not in (scrum_master.tags or "").split(","): raise HTTPException(400,"Select an employee tagged as a scrum master")
-    team=Team(project_id=project_id,name=data.name,discipline=data.discipline,scrum_master_id=data.scrum_master_id)
-    db.add(team); db.flush()
-    members=set(data.member_ids+[data.scrum_master_id])
-    for member_id in members:
-        member=db.get(User,member_id)
-        if not member: raise HTTPException(404,f"Team member {member_id} not found")
-        if member.role!="employee" or not member.active: raise HTTPException(400,"Team members must be active employees")
-        db.add(TeamMember(team_id=team.id,user_id=member_id,invitation_status="pending",is_scrum_master=member_id==data.scrum_master_id))
-    project.setup_status="pending_team_review"; db.commit(); db.refresh(team)
-    add_notification(db,team.scrum_master_id,"project","Review your proposed team",f"{team.name} · {project.name}",f"/teams/{team.id}/review"); db.commit()
-    for admin in db.scalars(select(User).where(User.role=="admin",User.active.is_(True))).all():
-        add_notification(db,admin.id,"project","Project team proposal created",f"{project.name} · {team.name} is awaiting scrum master review.",f"/admin/projects/pending")
+
+def require_scrum_master(user: User = Depends(require_roles("employee"))):
+    if not is_tagged(user, "scrum_master"):
+        raise HTTPException(403, "The scrum master tag is required")
+    return user
+
+
+def active_employees(db: Session, ids: set[int]):
+    employees = db.scalars(select(User).where(User.id.in_(ids), User.role == "employee", User.active.is_(True))).all()
+    if len(employees) != len(ids):
+        raise HTTPException(400, "Select active employee accounts")
+    return employees
+
+
+def roster_json(db: Session, team: RosterTeam, *, include_pending: bool):
+    owner = db.get(User, team.owner_id)
+    memberships = select(RosterMember, User).join(User, User.id == RosterMember.user_id).where(RosterMember.team_id == team.id)
+    if not include_pending:
+        memberships = memberships.where(RosterMember.status == "accepted", User.active.is_(True), User.role == "employee")
+    rows = db.execute(memberships.order_by(User.name, User.id)).all()
+    return {"id": team.id, "name": team.name, "owner_id": team.owner_id, "owner_name": owner.name,
+            "members": [{"id": member.id, "user_id": user.id, "name": user.name, "status": member.status}
+                        for member, user in rows]}
+
+
+@app.get("/roster-teams")
+def list_roster_teams(mine: bool = False, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    query = select(RosterTeam).join(User, User.id == RosterTeam.owner_id)
+    if mine:
+        require_scrum_master(user)
+        query = query.where(RosterTeam.owner_id == user.id)
+    elif user.role != "admin" and not (is_tagged(user, "product_owner") or is_tagged(user, "scrum_master")):
+        raise HTTPException(403, "Only project owners, scrum masters and admins can browse teams")
+    teams = db.scalars(query.order_by(RosterTeam.name, RosterTeam.id)).all()
+    return [roster_json(db, team, include_pending=mine) for team in teams
+            if mine or is_tagged(db.get(User, team.owner_id), "scrum_master")]
+
+
+@app.post("/roster-teams", status_code=201)
+def create_roster_team(data: RosterTeamIn, db: Session = Depends(get_db), owner: User = Depends(require_scrum_master)):
+    name = data.name.strip()
+    if len(name) < 2:
+        raise HTTPException(422, "Enter at least two characters for the team name")
+    duplicate = select(RosterTeam.id).where(RosterTeam.owner_id == owner.id, func.lower(RosterTeam.name) == name.lower())
+    if db.scalar(duplicate):
+        raise HTTPException(409, "You already have a team with that name")
+    team = RosterTeam(name=name, owner_id=owner.id)
+    db.add(team)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "You already have a team with that name")
+    return roster_json(db, team, include_pending=True)
+
+
+@app.post("/roster-teams/{team_id}/invitations", status_code=201)
+def invite_roster_members(team_id: int, data: InviteEmployeesIn, db: Session = Depends(get_db), owner: User = Depends(require_scrum_master)):
+    team = db.scalar(select(RosterTeam).where(RosterTeam.id == team_id, RosterTeam.owner_id == owner.id).with_for_update())
+    if not team:
+        raise HTTPException(404, "Team not found")
+    ids = set(data.user_ids) - {owner.id}
+    if not ids:
+        raise HTTPException(400, "Choose another employee")
+    active_employees(db, ids)
+    existing = {item.user_id: item for item in db.scalars(select(RosterMember).where(RosterMember.team_id == team.id).with_for_update())}
+    invited = 0
+    for user_id in sorted(ids):
+        member = existing.get(user_id)
+        if member and member.status != "rejected":
+            continue
+        if member:
+            member.status = "pending"
+        else:
+            db.add(RosterMember(team_id=team.id, user_id=user_id))
+        add_notification(db, user_id, "project", "Team invitation", f"{owner.name} invited you to join {team.name}.", "/invitations")
+        invited += 1
     db.commit()
-    return {"id":team.id,"project_id":project_id,"name":team.name,"discipline":team.discipline,"scrum_master_id":team.scrum_master_id,"invitations":"pending"}
+    return {"invited": invited, "team": roster_json(db, team, include_pending=True)}
+
+
+@app.get("/roster-invitations")
+def roster_invitations(db: Session = Depends(get_db), user: User = Depends(require_roles("employee"))):
+    rows = db.execute(select(RosterMember, RosterTeam, User).join(RosterTeam, RosterTeam.id == RosterMember.team_id)
+                      .join(User, User.id == RosterTeam.owner_id)
+                      .where(RosterMember.user_id == user.id, RosterMember.status == "pending")).all()
+    return [{"id": member.id, "team": team.name, "owner": owner.name} for member, team, owner in rows
+            if is_tagged(owner, "scrum_master")]
+
+
+@app.post("/roster-invitations/{invitation_id}/respond")
+def respond_roster_invitation(invitation_id: int, data: DecisionIn, db: Session = Depends(get_db), user: User = Depends(require_roles("employee"))):
+    member = db.scalar(select(RosterMember).where(RosterMember.id == invitation_id, RosterMember.user_id == user.id).with_for_update())
+    if not member:
+        raise HTTPException(404, "Team invitation not found")
+    team = db.get(RosterTeam, member.team_id)
+    if not is_tagged(db.get(User, team.owner_id), "scrum_master"):
+        raise HTTPException(409, "This team is unavailable")
+    if member.status == "pending":
+        member.status = "accepted" if data.accept else "rejected"
+        add_notification(db, team.owner_id, "project", "Team invitation response",
+                         f"{user.name} {member.status} the invitation to {team.name}.", "/roster-teams")
+        db.commit()
+    return {"id": member.id, "status": member.status}
+
+
+def roster_project_members(db: Session, team_ids: list[int]):
+    members = set()
+    for team_id in set(team_ids):
+        team = db.get(RosterTeam, team_id)
+        if not team or not is_tagged(db.get(User, team.owner_id), "scrum_master"):
+            raise HTTPException(400, "Choose available workspace teams")
+        members.add(team.owner_id)
+        members.update(db.scalars(select(RosterMember.user_id).join(User, User.id == RosterMember.user_id).where(
+            RosterMember.team_id == team.id, RosterMember.status == "accepted",
+            User.active.is_(True), User.role == "employee")))
+    return members
+
+
+def project_team_json(db: Session, team: Team):
+    members = db.execute(select(TeamMember, User).join(User, User.id == TeamMember.user_id)
+                         .where(TeamMember.team_id == team.id).order_by(User.name, User.id))
+    return {"id": team.id, "name": team.name, "discipline": team.discipline,
+            "scrum_master_id": team.scrum_master_id, "review_status": team.review_status,
+            "members": [{"user_id": member.user_id, "name": user.name, "status": member.invitation_status,
+                         "is_scrum_master": member.is_scrum_master} for member, user in members]}
+
+
+@app.post("/projects/{project_id}/teams/batch",status_code=201)
+def add_project_teams(project_id: int, data: TeamBatchIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "employee"))):
+    project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if user.role != "admin" and (project.owner_id != user.id or not is_tagged(user, "product_owner")):
+        raise HTTPException(403, "Only the tagged project owner can propose teams")
+    if project.setup_status != "draft":
+        raise HTTPException(409, "Teams have already been submitted for this project")
+    names = [item.name.strip().casefold() for item in data.teams]
+    if any(not name or len(name) > 120 for name in names) or len(names) != len(set(names)):
+        raise HTTPException(400, "Team names must be unique and between 1 and 120 characters")
+    created = []
+    for item in data.teams:
+        lead = db.get(User, item.scrum_master_id)
+        if not is_tagged(lead, "scrum_master"):
+            raise HTTPException(400, "Each team needs an active employee tagged as its scrum master")
+        members = set(item.member_ids) | roster_project_members(db, item.roster_team_ids) | {lead.id}
+        if len(members) > 100:
+            raise HTTPException(400, "A project team can have at most 100 members")
+        active_employees(db, members)
+        team = Team(project_id=project.id, name=item.name.strip(), discipline=item.discipline.strip()[:80],
+                    scrum_master_id=lead.id, review_status="pending_admin_review")
+        db.add(team)
+        db.flush()
+        for member_id in sorted(members):
+            db.add(TeamMember(team_id=team.id, user_id=member_id, invitation_status="pending", is_scrum_master=member_id == lead.id))
+        created.append(team)
+    project.setup_status = "pending_admin_review"
+    for admin_id in active_admin_ids(db):
+        add_notification(db, admin_id, "project", "Project team proposal ready for review", project.name, "/admin/projects/pending")
+    db.commit()
+    return [project_team_json(db, team) for team in created]
+
+
+@app.post("/projects/{project_id}/teams", status_code=201)
+def add_team(project_id: int, data: TeamIn, db: Session = Depends(get_db), user: User = Depends(require_roles("admin", "employee"))):
+    return add_project_teams(project_id, TeamBatchIn(teams=[data]), db, user)[0]
+
+
+@app.patch("/admin/projects/{project_id}/teams/{team_id}")
+def admin_edit_project_team(project_id: int, team_id: int, data: AdminProjectTeamIn,
+                            db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):
+    project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    team = db.get(Team, team_id)
+    if not project or not team or team.project_id != project.id:
+        raise HTTPException(404, "Project team not found")
+    if project.setup_status not in {"pending_admin_review", "pending_team_review"}:
+        raise HTTPException(409, "Only pending proposals can be edited here")
+    if not is_tagged(db.get(User, data.scrum_master_id), "scrum_master"):
+        raise HTTPException(400, "Select an active employee tagged as scrum master")
+    ids = set(data.member_ids) | {data.scrum_master_id}
+    if len(ids) > 100:
+        raise HTTPException(400, "A project team can have at most 100 members")
+    active_employees(db, ids)
+    team.scrum_master_id = data.scrum_master_id
+    team.review_status = "pending_admin_review"
+    existing = db.scalars(select(TeamMember).where(TeamMember.team_id == team.id).with_for_update()).all()
+    for member in existing:
+        if member.user_id not in ids:
+            db.delete(member)
+        else:
+            member.is_scrum_master = member.user_id == team.scrum_master_id
+    for member_id in ids - {member.user_id for member in existing}:
+        db.add(TeamMember(team_id=team.id, user_id=member_id, invitation_status="pending", is_scrum_master=member_id == team.scrum_master_id))
+    db.commit()
+    return project_team_json(db, team)
+
+
+@app.get("/scrum-master/project-teams")
+def scrum_master_project_teams(db: Session = Depends(get_db), user: User = Depends(require_scrum_master)):
+    rows = db.execute(select(Team, Project).join(Project).where(
+        Team.scrum_master_id == user.id, Project.setup_status == "approved",
+        Project.completed_at.is_(None), Project.cancellation_status != "approved").order_by(Project.name, Team.name))
+    return [{**project_team_json(db, team), "project_id": project.id, "project_name": project.name} for team, project in rows]
+
+
+@app.post("/teams/{team_id}/invitations", status_code=201)
+def invite_project_members(team_id: int, data: InviteEmployeesIn, db: Session = Depends(get_db), owner: User = Depends(require_scrum_master)):
+    team = db.scalar(select(Team).where(Team.id == team_id, Team.scrum_master_id == owner.id).with_for_update())
+    if not team:
+        raise HTTPException(404, "Project team not found")
+    project = db.get(Project, team.project_id)
+    if project.setup_status != "approved" or project.completed_at or project.cancellation_status == "approved":
+        raise HTTPException(409, "Project invitations require an approved, open project")
+    ids = set(data.user_ids) - {owner.id}
+    if not ids:
+        raise HTTPException(400, "Choose another employee")
+    active_employees(db, ids)
+    existing = {member.user_id: member for member in db.scalars(select(TeamMember).where(TeamMember.team_id == team.id).with_for_update())}
+    invited = 0
+    for user_id in sorted(ids):
+        member = existing.get(user_id)
+        if member and member.invitation_status != "rejected":
+            continue
+        if member:
+            member.invitation_status = "pending"
+        else:
+            db.add(TeamMember(team_id=team.id, user_id=user_id, invitation_status="pending"))
+        add_notification(db, user_id, "project", "Project invitation", f"{owner.name} invited you to {team.name} on {project.name}.", "/invitations")
+        invited += 1
+    db.commit()
+    return {"invited": invited, "team": {**project_team_json(db, team), "project_id": project.id, "project_name": project.name}}
+
 
 @app.post("/teams/{team_id}/review")
 def review_team(team_id:int,data:TeamReviewIn,db:Session=Depends(get_db),user:User=Depends(require_roles("employee"))):
@@ -617,6 +1103,7 @@ def review_team(team_id:int,data:TeamReviewIn,db:Session=Depends(get_db),user:Us
     if not team: raise HTTPException(404,"Team not found")
     if team.scrum_master_id!=user.id or "scrum_master" not in (user.tags or "").split(","): raise HTTPException(403,"Only this team's tagged scrum master can review it")
     project=db.get(Project,team.project_id)
+    if project.setup_status!="pending_team_review": raise HTTPException(409,"This proposal is no longer in scrum master review")
     if data.accept:
         team.review_status="approved"
     else:
@@ -657,41 +1144,65 @@ def list_teams(project_id:int,db:Session=Depends(get_db),user:User=Depends(curre
     if not project: raise HTTPException(404,"Project not found")
     if not can_view_project(db,project,user): raise HTTPException(403,"Not a member of this project")
     teams=db.scalars(select(Team).where(Team.project_id==project_id)).all()
-    return [{"id":t.id,"name":t.name,"discipline":t.discipline,"scrum_master_id":t.scrum_master_id,"review_status":t.review_status,"members":[{"user_id":m.user_id,"status":m.invitation_status,"is_scrum_master":m.is_scrum_master} for m in db.scalars(select(TeamMember).where(TeamMember.team_id==t.id)).all()]} for t in teams]
+    return [project_team_json(db, team) for team in teams]
+
 
 @app.post("/admin/projects/{project_id}/approve")
-def approve_setup(project_id:int,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
-    project=db.get(Project,project_id)
-    if not project: raise HTTPException(404,"Project not found")
-    teams=db.scalars(select(Team).where(Team.project_id==project_id)).all()
-    if not teams: raise HTTPException(400,"Add at least one team before approval")
-    if any(team.review_status!="approved" for team in teams): raise HTTPException(409,"Every team must be reviewed by its scrum master and project owner first")
-    project.setup_status="approved"
-    memberships=db.scalars(select(TeamMember).join(Team).where(Team.project_id==project_id,TeamMember.invitation_status=="pending")).all()
-    for member in memberships:
-        add_notification(db,member.user_id,"project","Project invitation",f"You have been invited to {project.name}.","/invitations")
+def approve_setup(project_id: int, db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):
+    project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if not project:
+        raise HTTPException(404, "Project not found")
+    if project.setup_status == "approved":
+        return project_json(project, db)
+    if project.setup_status not in {"pending_admin_review", "pending_team_review"}:
+        raise HTTPException(409, "Submit a team proposal before approval")
+    teams = db.scalars(select(Team).where(Team.project_id == project_id)).all()
+    if not teams:
+        raise HTTPException(400, "Add at least one team before approval")
+    for team in teams:
+        if not is_tagged(db.get(User, team.scrum_master_id), "scrum_master"):
+            raise HTTPException(409, f"Choose an active scrum master for {team.name}")
+        team.review_status = "approved"
+    memberships = db.scalars(select(TeamMember).join(Team).where(
+        Team.project_id == project_id, TeamMember.invitation_status == "pending")).all()
+    active_employees(db, {member.user_id for member in memberships})
+    project.setup_status = "approved"
+    sync_request_status(db, project.id, "approved")
+    for user_id in {project.owner_id, project.client_id}:
+        add_notification(db, user_id, "project", "Project team proposal approved", project.name, f"/projects/{project.id}")
+    for user_id in {member.user_id for member in memberships}:
+        add_notification(db, user_id, "project", "Project invitation", f"The team proposal for {project.name} was approved. Review your invitation.", "/invitations")
     db.commit()
-    return project_json(project,db)
+    return project_json(project, db)
+
 
 @app.get("/admin/projects/pending")
 def pending_project_setups(db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
-    rows=db.scalars(select(Project).where(Project.setup_status=="pending_admin_review")).all()
+    rows=db.scalars(select(Project).where(Project.setup_status.in_(["pending_admin_review","pending_team_review"]))).all()
     return [project_json(p,db) for p in rows]
 
 @app.get("/invitations")
 def invitations(db:Session=Depends(get_db),user:User=Depends(require_roles("employee"))):
-    rows=db.execute(select(TeamMember,Team,Project).join(Team,Team.id==TeamMember.team_id).join(Project,Project.id==Team.project_id).where(TeamMember.user_id==user.id,TeamMember.invitation_status=="pending")).all()
+    rows=db.execute(select(TeamMember,Team,Project).join(Team,Team.id==TeamMember.team_id).join(Project,Project.id==Team.project_id).where(TeamMember.user_id==user.id,TeamMember.invitation_status=="pending",Project.setup_status=="approved")).all()
     return [{"id":m.id,"team_id":t.id,"team":t.name,"project_id":p.id,"project":p.name,"is_scrum_master":m.is_scrum_master} for m,t,p in rows]
 
 @app.post("/invitations/{membership_id}/respond")
 def respond_invitation(membership_id:int,data:DecisionIn,db:Session=Depends(get_db),user:User=Depends(require_roles("employee"))):
-    membership=db.get(TeamMember,membership_id)
-    if not membership or membership.user_id!=user.id: raise HTTPException(404,"Invitation not found")
-    membership.invitation_status="accepted" if data.accept else "rejected"; db.commit()
-    team=db.get(Team,membership.team_id); project=db.get(Project,team.project_id)
-    add_notification(db,project.owner_id,"project","Team invitation response",f"A team member {membership.invitation_status} the {team.name} invitation.",f"/projects/{project.id}")
-    db.commit()
-    return {"id":membership.id,"status":membership.invitation_status}
+    membership = db.scalar(select(TeamMember).where(TeamMember.id == membership_id, TeamMember.user_id == user.id).with_for_update())
+    if not membership:
+        raise HTTPException(404, "Invitation not found")
+    team = db.get(Team, membership.team_id)
+    project = db.get(Project, team.project_id)
+    if project.setup_status != "approved":
+        raise HTTPException(409, "The project has not been approved")
+    if membership.invitation_status == "pending":
+        membership.invitation_status = "accepted" if data.accept else "rejected"
+        for user_id in {project.owner_id, team.scrum_master_id} - {user.id}:
+            add_notification(db, user_id, "project", "Project invitation response",
+                             f"{user.name} {membership.invitation_status} the invitation to {team.name}.", f"/projects/{project.id}")
+        db.commit()
+    return {"id": membership.id, "status": membership.invitation_status}
+
 
 def has_active_task(db:Session,assignee_id:int,exclude_id:int|None=None):
     stmt=select(Task).where(Task.assignee_id==assignee_id,Task.status=="in_progress")
@@ -798,19 +1309,21 @@ def list_tasks(project_id:int,db:Session=Depends(get_db),user:User=Depends(requi
 
 @app.patch("/tasks/{task_id}/status")
 def update_task_status(task_id:int,status:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    task=db.get(Task,task_id)
+    task=db.scalar(select(Task).where(Task.id==task_id).with_for_update())
     if not task: raise HTTPException(404,"Task not found")
+    if user.role=="client": raise HTTPException(403,"Clients cannot change task status")
     if user.role=="employee" and task.assignee_id!=user.id: raise HTTPException(403,"Only the assignee can update this task")
     if status=="in_progress" and task.assignee_id and has_active_task(db,task.assignee_id,task.id): raise HTTPException(409,"One active task per teammate")
     if status not in {"waiting","in_progress","in_review","done"}:
         raise HTTPException(400,"Status must be waiting, in_progress, in_review, or done")
-    if status=="done" and task.status!="done" and task.assignee_id:
+    if status=="done" and not task.completion_rewarded and task.assignee_id:
         assignee=db.get(User,task.assignee_id)
         if assignee:
+            task.completion_rewarded=True
             reward={"simple":10,"standard":20,"complex":35}.get(task.complexity,15)
             assignee.experience_points+=reward
             assignee.level=1+assignee.experience_points//100
-    task.status=status; sync_project_progress(db,task.project_id); db.commit(); return task_json(task)
+    task.status=status; db.flush(); sync_project_progress(db,task.project_id); db.commit(); return task_json(task)
 
 @app.post("/projects/{project_id}/tasks/generate")
 def generate_tasks(project_id:int,scope:str,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
@@ -842,7 +1355,9 @@ async def upload_contract(project_id:int,file:UploadFile=File(...),db:Session=De
     version=(db.scalar(select(Contract).where(Contract.project_id==project_id).order_by(Contract.version.desc())) or None)
     record=Contract(project_id=project_id,uploaded_by=user.id,filename=safe_name,storage_path=str(path),version=(version.version+1 if version else 1),status="pending_admin_review")
     db.add(record); db.commit(); db.refresh(record)
-    return {"id":record.id,"filename":record.filename,"version":record.version,"status":record.status}
+    client = db.get(User, project.client_id)
+    owner = db.get(User, project.owner_id)
+    return {"id":record.id,"filename":record.filename,"version":record.version,"status":record.status,"project_id":project.id,"project_name":project.name,"project_client_id":project.client_id,"project_client_name":client_label(client),"project_owner_id":project.owner_id,"project_owner_name":owner.name if owner else None,"signatures":[],"created_at":record.created_at}
 
 @app.get("/projects/{project_id}/contracts")
 def list_contracts(project_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -852,7 +1367,9 @@ def list_contracts(project_id:int,db:Session=Depends(get_db),user:User=Depends(c
     member=user.role=="employee" and db.scalar(select(TeamMember.id).join(Team).where(Team.project_id==project_id,TeamMember.user_id==user.id,TeamMember.invitation_status=="accepted")) is not None
     if user.role=="employee" and user.id!=project.owner_id and not member: raise HTTPException(403,"You are not a member of this project")
     rows=db.scalars(select(Contract).where(Contract.project_id==project_id).order_by(Contract.version.desc())).all()
-    return [{"id":c.id,"filename":c.filename,"version":c.version,"status":c.status,"uploaded_by":c.uploaded_by,"created_at":c.created_at,"signatures":[{"user_id":s.user_id,"signed_at":s.signed_at} for s in db.scalars(select(ContractSignature).where(ContractSignature.contract_id==c.id)).all()]} for c in rows]
+    client = db.get(User, project.client_id)
+    owner = db.get(User, project.owner_id)
+    return [{"id":c.id,"filename":c.filename,"version":c.version,"status":c.status,"uploaded_by":c.uploaded_by,"created_at":c.created_at,"project_client_id":project.client_id,"project_client_name":client_label(client),"project_owner_id":project.owner_id,"project_owner_name":owner.name if owner else None,"signatures":[{"user_id":s.user_id,"signed_at":s.signed_at} for s in db.scalars(select(ContractSignature).where(ContractSignature.contract_id==c.id)).all()]} for c in rows]
 
 @app.get("/contracts/{contract_id}/file")
 def contract_file(contract_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -913,6 +1430,59 @@ def review_contract(contract_id:int,data:ContractReviewIn,db:Session=Depends(get
     add_notification(db,project.owner_id,"contract",title,body,f"/projects/{project.id}/contracts")
     db.commit()
     return {"id":c.id,"status":c.status}
+
+@app.patch("/admin/contracts/{contract_id}/signatures")
+def admin_update_contract_signatures(
+    contract_id: int, data: ContractAdminSignaturesIn,
+    db: Session = Depends(get_db), admin: User = Depends(require_roles("admin")),
+):
+    contract = db.get(Contract, contract_id)
+    if not contract:
+        raise HTTPException(404, "Contract not found")
+    project = db.get(Project, contract.project_id)
+    parties = {"client": project.client_id, "owner": project.owner_id}
+    signed_ids = {parties[party] for party in data.signed_by}
+    signatures = db.scalars(select(ContractSignature).where(ContractSignature.contract_id == contract.id)).all()
+    existing = {signature.user_id: signature for signature in signatures}
+    for user_id, signature in existing.items():
+        if user_id not in signed_ids:
+            db.delete(signature)
+    for user_id in signed_ids - existing.keys():
+        db.add(ContractSignature(contract_id=contract.id, user_id=user_id))
+    if {project.client_id, project.owner_id}.issubset(signed_ids):
+        contract.status = "signed"
+        project.stage = "Planning"
+    else:
+        contract.status = "approved_pending_signatures"
+    for user_id in {project.client_id, project.owner_id}:
+        add_notification(
+            db, user_id, "contract", "Contract signature updated",
+            f"An administrator updated the recorded signatures for {project.name}, version {contract.version}.",
+            f"/projects/{project.id}/contracts",
+        )
+    db.commit()
+    db.refresh(contract)
+    return {
+        "id": contract.id,
+        "status": contract.status,
+        "signatures": [
+            {"user_id": signature.user_id, "signed_at": signature.signed_at}
+            for signature in db.scalars(select(ContractSignature).where(ContractSignature.contract_id == contract.id)).all()
+        ],
+    }
+
+@app.delete("/admin/contracts/{contract_id}")
+def admin_delete_contract(contract_id: int, db: Session = Depends(get_db), admin: User = Depends(require_roles("admin"))):
+    contract = db.get(Contract, contract_id)
+    if not contract:
+        raise HTTPException(404, "Contract not found")
+    path = Path(contract.storage_path)
+    if path.is_file():
+        path.unlink()
+    db.execute(delete(ContractSignature).where(ContractSignature.contract_id == contract.id))
+    db.delete(contract)
+    db.commit()
+    return {"id": contract_id, "deleted": True}
 
 @app.post("/projects/{project_id}/cancellation-requests",status_code=201)
 def request_cancellation(project_id:int,data:CancelIn,db:Session=Depends(get_db),user:User=Depends(require_roles("client"))):

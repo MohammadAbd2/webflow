@@ -61,3 +61,31 @@ Make the client, employee, and admin dashboards reliable views of the same proje
 - Implement one complete workflow slice at a time, including API authorization, UI loading/error/success states, and persistence checks.
 - Keep local preview data visibly separate from authenticated, server-backed data.
 - Update this checklist when a phase item is completed or a new blocking gap is found.
+
+## Phase 7 — Client requests and team coordination
+
+- [x] Expand the client request workspace, personalize client labels, and add editable organization and telephone fields.
+- [x] Paginate People & teams at 25 users per page and notify users of role and tag changes.
+- [x] Add an admin client-request queue with status management and date-filtered bulk actions.
+- [x] Give Scrum masters a Teams workspace for reusable rosters and employee invitations with accept/decline notifications.
+- [x] Let project owners generate editable suggestions, search for Scrum masters, and select reusable teams. Give admins member-level review before approving project invitations.
+- [x] Let Scrum masters invite selected employees from multiple rosters to their approved project teams.
+- [x] Verify the workflows through API integration tests and a production-build/Docker HTTP smoke test; apply them to the local Docker app.
+
+## Phase 8 — Project teams, activity, and role-based reviews
+
+- [x] Fix the live Project teams view for numeric account IDs and open member profiles from a selected team.
+- [x] Replace fabricated dashboard and project activity with persisted notification events.
+- [x] Preview the exact requests matched by admin bulk status/date actions.
+- [x] Move ratings from employee profiles into completed project workflows: client → product owner → scrum master → accepted team members.
+- [x] Restrict delivery-step edits to project owners tagged as product owners and administrators.
+- [x] Verify role-specific review permissions and rebuild/smoke-test the team/activity screens in the local app.
+
+## Phase 9 — Account photos, admin status controls, and readability
+
+- [x] Store uploaded account photos on the API and use the shared URL for account and team-member avatars.
+- [x] Let admins mark projects completed, canceled, or reopened from project status controls and the approval workspace.
+- [x] Show live project details/statuses in Review & approvals rather than a count-only approved-project summary.
+- [x] Let admins record client/product-owner contract signatures and delete contract files with confirmation.
+- [x] Improve role selector presentation and raise small-text readability across the app.
+- [x] Verify API authorization, persisted image retrieval, contract file deletion, project status transitions, frontend build, and Docker smoke checks.
