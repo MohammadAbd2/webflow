@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select, func, inspect, text, or_, delete
 from .db import Base, SessionLocal, engine, get_db
 from .models import User, UserTag, Project, ProjectStep, Team, TeamMember, Sprint, Task, Contract, ContractSignature, CancellationRequest, ProjectRequest, ProjectRequestComment, RosterTeam, RosterMember, EmployeeReview, Notification, Conversation, ConversationMember, Message
-from .schemas import RegisterIn, LoginIn, AccountUpdateIn, ProjectCompletionIn, AdminProjectStatusIn, ProjectIn, ProjectStepIn, ProjectRequestIn, ProjectRequestCommentIn, EmployeeProfileIn, EmployeeReviewIn, EmployeeReviewUpdateIn, UserTagIn, UserRoleIn, TeamIn, TeamBatchIn, TeamReviewIn, TaskIn, SprintIn, TaskSprintIn, DecisionIn, ContractReviewIn, ContractAdminSignaturesIn, CancelIn, ConversationIn, MessageIn, NotificationReadIn, UserStatusIn, ClientProfileIn, AdminRequestChangeIn, RosterTeamIn, InviteEmployeesIn, AdminProjectTeamIn
+from .schemas import RegisterIn, LoginIn, AccountUpdateIn, ProjectCompletionIn, AdminProjectStatusIn, ProjectIn, ProjectStepIn, ProjectRequestIn, ProjectRequestCommentIn, EmployeeProfileIn, EmployeeReviewIn, EmployeeReviewUpdateIn, UserTagIn, UserRoleIn, TeamIn, TeamBatchIn, TeamReviewIn, TaskIn, TaskUpdateIn, TaskWorkflowIn, SprintIn, SprintReviewIn, TaskSprintIn, DecisionIn, ContractReviewIn, ContractAdminSignaturesIn, CancelIn, ConversationIn, MessageIn, NotificationReadIn, UserStatusIn, AdminExperiencePointsIn, ClientProfileIn, AdminRequestChangeIn, RosterTeamIn, InviteEmployeesIn, AdminProjectTeamIn
 from .security import hash_password, verify_password, issue_token, current_user, require_roles
 
 app = FastAPI(title="Webflow Project Hub API", version="1.0.0")
@@ -60,7 +60,36 @@ def startup():
     if "completion_rewarded" not in task_columns:
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE tasks ADD COLUMN completion_rewarded BOOLEAN NOT NULL DEFAULT FALSE"))
+    if "project_step_id" not in task_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN project_step_id INTEGER NULL"))
+    if "position" not in task_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN position INTEGER NOT NULL DEFAULT 0"))
+    if "trigger_task_ids_json" not in task_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN trigger_task_ids_json TEXT NULL"))
+            connection.execute(text("UPDATE tasks SET trigger_task_ids_json = '[]' WHERE trigger_task_ids_json IS NULL"))
+    if "completed_at" not in task_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN completed_at DATETIME NULL"))
+            connection.execute(text("UPDATE tasks SET completed_at = created_at WHERE status = 'done'"))
+    if "estimated_hours" not in task_columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE tasks ADD COLUMN estimated_hours FLOAT NOT NULL DEFAULT 4"))
+    if "completion_rewarded" not in task_columns:
+        with engine.begin() as connection:
             connection.execute(text("UPDATE tasks SET completion_rewarded = TRUE WHERE status = 'done'"))
+    sprint_columns = {column["name"] for column in inspect(engine).get_columns("sprints")}
+    with engine.begin() as connection:
+        if "what_went_well" not in sprint_columns:
+            connection.execute(text("ALTER TABLE sprints ADD COLUMN what_went_well TEXT NULL"))
+        if "what_went_wrong" not in sprint_columns:
+            connection.execute(text("ALTER TABLE sprints ADD COLUMN what_went_wrong TEXT NULL"))
+        if "next_actions" not in sprint_columns:
+            connection.execute(text("ALTER TABLE sprints ADD COLUMN next_actions TEXT NULL"))
+        if "reviewed_at" not in sprint_columns:
+            connection.execute(text("ALTER TABLE sprints ADD COLUMN reviewed_at DATETIME NULL"))
     team_columns = {column["name"] for column in inspect(engine).get_columns("teams")}
     if "review_status" not in team_columns:
         with engine.begin() as connection:
@@ -142,7 +171,30 @@ def project_json(p, db=None):
     return {"id":p.id,"name":p.name,"description":p.description,"client_id":p.client_id,"client_name":client_label(client),"owner_id":p.owner_id,"owner_name":owner.name if owner else None,"stage":p.stage,"progress":100 if p.completed_at else p.progress,"target_date":p.target_date,"setup_status":p.setup_status,"cancellation_status":p.cancellation_status,"completion_due_at":utc_iso(p.completion_due_at),"completed_at":utc_iso(p.completed_at)}
 
 def task_json(t):
-    return {"id":t.id,"project_id":t.project_id,"team_id":t.team_id,"title":t.title,"description":t.description,"status":t.status,"priority":t.priority,"complexity":t.complexity,"story_points":t.story_points,"assignee_id":t.assignee_id,"sprint_id":t.sprint_id,"ai_generated":t.ai_generated,"due_date":t.due_date}
+    try:
+        trigger_task_ids=json.loads(t.trigger_task_ids_json or "[]")
+    except (TypeError, json.JSONDecodeError):
+        trigger_task_ids=[]
+    return {"id":t.id,"project_id":t.project_id,"team_id":t.team_id,"title":t.title,"description":t.description,"status":t.status,"priority":t.priority,"complexity":t.complexity,"story_points":t.story_points,"estimated_hours":t.estimated_hours,"assignee_id":t.assignee_id,"sprint_id":t.sprint_id,"project_step_id":t.project_step_id,"position":t.position,"trigger_task_ids":trigger_task_ids,"ai_generated":t.ai_generated,"due_date":t.due_date,"completed_at":t.completed_at}
+
+def can_manage_project_tasks(db:Session,project:Project,user:User)->bool:
+    if user.role=="admin":
+        return True
+    if user.role!="employee":
+        return False
+    if project.owner_id==user.id and is_tagged(user,"product_owner"):
+        return True
+    if not is_tagged(user,"scrum_master"):
+        return False
+    return db.scalar(select(Team.id).where(Team.project_id==project.id,Team.scrum_master_id==user.id)) is not None
+
+def reorder_task(db:Session,task:Task,status:str,position:int|None):
+    siblings=db.scalars(select(Task).where(Task.project_id==task.project_id,Task.status==status,Task.id!=task.id).order_by(Task.position,Task.created_at,Task.id).with_for_update()).all()
+    insertion=max(0,min(position if position is not None else len(siblings),len(siblings)))
+    siblings.insert(insertion,task)
+    for index,row in enumerate(siblings):
+        row.status=status
+        row.position=index
 
 def add_notification(db:Session,user_id:int,kind:str,title:str,body:str="",target:str=""):
     db.add(Notification(user_id=user_id,kind=kind,title=title,body=body,target=target))
@@ -657,13 +709,16 @@ def update_project_steps(project_id:int,steps:list[ProjectStepIn],db:Session=Dep
     if any(not name for name in names) or len(names)!=len(set(names)): raise HTTPException(400,"Step names must be unique and non-empty")
     old=db.scalars(select(ProjectStep).where(ProjectStep.project_id==project_id).order_by(ProjectStep.position)).all()
     progress_by_name={s.name.casefold():s.progress for s in old}
+    old_names={task.id:next((s.name.casefold() for s in old if s.id==task.project_step_id),None) for task in db.scalars(select(Task).where(Task.project_id==project_id)).all()}
     for s in old: db.delete(s)
     db.flush()
+    steps_by_name={}
     for position,step in enumerate(steps):
         name=step.name.strip()
-        db.add(ProjectStep(project_id=project_id,name=name,description=step.description.strip(),position=position,progress=progress_by_name.get(name.casefold(),0)))
-    total=len(steps)
-    project.progress=round(sum(progress_by_name.get(name,0) for name in names)/total)
+        row=ProjectStep(project_id=project_id,name=name,description=step.description.strip(),position=position,progress=progress_by_name.get(name.casefold(),0))
+        db.add(row);db.flush();steps_by_name[name.casefold()]=row.id
+    for task_id,old_name in old_names.items():
+        db.get(Task,task_id).project_step_id=steps_by_name.get(old_name)
     project.stage=next((step.name.strip() for step in steps if progress_by_name.get(step.name.strip().casefold(),0)<100),steps[-1].name.strip())
     db.commit()
     return [step_json(s) for s in db.scalars(select(ProjectStep).where(ProjectStep.project_id==project_id).order_by(ProjectStep.position)).all()]
@@ -672,11 +727,10 @@ def update_project_steps(project_id:int,steps:list[ProjectStepIn],db:Session=Dep
 def update_step_progress(project_id:int,step_id:int,progress:int,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
     project=db.get(Project,project_id); step=db.get(ProjectStep,step_id)
     if not project or not step or step.project_id!=project_id: raise HTTPException(404,"Project step not found")
-    if user.role=="employee" and (user.id!=project.owner_id or "product_owner" not in (user.tags or "").split(",")): raise HTTPException(403,"Only the tagged project owner can update step progress")
+    if not can_manage_project_tasks(db,project,user): raise HTTPException(403,"Only an administrator, project owner, or project scrum master can update delivery steps")
     if not 0<=progress<=100: raise HTTPException(400,"Progress must be between 0 and 100")
     step.progress=progress
     rows=db.scalars(select(ProjectStep).where(ProjectStep.project_id==project_id).order_by(ProjectStep.position)).all()
-    project.progress=round(sum(s.progress for s in rows)/len(rows))
     project.stage=next((s.name for s in rows if s.progress<100),rows[-1].name)
     db.commit(); return step_json(step)
 
@@ -705,15 +759,34 @@ def update_user_status(user_id:int,data:UserStatusIn,db:Session=Depends(get_db),
     add_notification(db,target.id,"security","Account reactivated" if data.active else "Account suspended","An administrator changed the status of your account.")
     db.commit(); return {"id":target.id,"active":target.active}
 
+@app.patch("/admin/users/{user_id}/experience")
+def update_user_experience(user_id:int,data:AdminExperiencePointsIn,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
+    target=db.get(User,user_id)
+    if not target: raise HTTPException(404,"User not found")
+    if data.delta==0: raise HTTPException(400,"XP adjustment must be greater than zero or less than zero")
+    previous=target.experience_points
+    target.experience_points=max(0,target.experience_points+data.delta)
+    target.level=1+target.experience_points//100
+    change=target.experience_points-previous
+    if change:
+        add_notification(db,target.id,"task","Experience points updated",
+                         f"An administrator {'added' if change>0 else 'removed'} {abs(change)} XP. Your total is now {target.experience_points} XP.")
+    db.commit()
+    return {"id":target.id,"experience_points":target.experience_points,"level":target.level,"change":change}
+
 @app.get("/admin/users")
 def admin_users(q:str="",role:str="",limit:int=25,offset:int=0,include_total:bool=False,db:Session=Depends(get_db),admin:User=Depends(require_roles("admin"))):
-    query=select(User)
-    if role in {"admin","employee","client"}: query=query.where(User.role==role)
+    filters=[]
     if q.strip():
-        term=q.strip();query=query.where(or_(func.lower(User.name).contains(term.lower()),func.lower(User.email).contains(term.lower()),User.id==int(term) if term.isdigit() else text("0=1")))
+        term=q.strip();filters.append(or_(func.lower(User.name).contains(term.lower()),func.lower(User.email).contains(term.lower()),User.id==int(term) if term.isdigit() else text("0=1")))
+    query=select(User).where(*filters)
+    if role in {"admin","employee","client"}: query=query.where(User.role==role)
     items = [account_json(row) for row in db.scalars(query.order_by(User.name, User.id).offset(max(offset,0)).limit(min(max(limit,1),25))).all()]
     if include_total:
-        return {"items": items, "total": db.scalar(select(func.count()).select_from(query.subquery()))}
+        counts={"all":db.scalar(select(func.count(User.id)).where(*filters)) or 0}
+        for account_role in ("client","employee","admin"):
+            counts[account_role]=db.scalar(select(func.count(User.id)).where(*filters,User.role==account_role)) or 0
+        return {"items": items, "total": db.scalar(select(func.count()).select_from(query.subquery())), "counts":counts}
     return items
 
 @app.patch("/admin/users/{user_id}/role")
@@ -1096,6 +1169,25 @@ def invite_project_members(team_id: int, data: InviteEmployeesIn, db: Session = 
     db.commit()
     return {"invited": invited, "team": {**project_team_json(db, team), "project_id": project.id, "project_name": project.name}}
 
+@app.delete("/teams/{team_id}/members/{user_id}")
+def remove_project_team_member(team_id:int,user_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    team=db.get(Team,team_id)
+    if not team: raise HTTPException(404,"Project team not found")
+    if user.role!="admin" and (user.role!="employee" or not is_tagged(user,"scrum_master") or team.scrum_master_id!=user.id):
+        raise HTTPException(403,"Only an administrator or this team's scrum master can remove members")
+    member=db.scalar(select(TeamMember).where(TeamMember.team_id==team_id,TeamMember.user_id==user_id))
+    if not member: raise HTTPException(404,"Team member not found")
+    if member.is_scrum_master: raise HTTPException(400,"The scrum master cannot be removed from their own team")
+    target=db.get(User,user_id)
+    for task in db.scalars(select(Task).where(Task.team_id==team_id,Task.assignee_id==user_id,Task.status!="done")).all():
+        task.assignee_id=None
+        task.status="waiting"
+        task.completed_at=None
+    db.delete(member)
+    if target: add_notification(db,target.id,"project","Removed from project team",f"You were removed from the {team.name} team.",f"/projects/{team.project_id}")
+    db.commit()
+    return {"removed":user_id,"team_id":team_id}
+
 
 @app.post("/teams/{team_id}/review")
 def review_team(team_id:int,data:TeamReviewIn,db:Session=Depends(get_db),user:User=Depends(require_roles("employee"))):
@@ -1212,9 +1304,12 @@ def has_active_task(db:Session,assignee_id:int,exclude_id:int|None=None):
 def sync_project_progress(db:Session,project_id:int):
     project=db.get(Project,project_id)
     tasks=db.scalars(select(Task).where(Task.project_id==project_id)).all()
-    if not project or not tasks: return
-    total=sum(max(t.story_points,1) for t in tasks)
-    complete=sum(max(t.story_points,1) for t in tasks if t.status=="done")
+    if not project: return
+    if not tasks:
+        project.progress=0
+        return
+    total=len(tasks)
+    complete=sum(1 for t in tasks if t.status=="done")
     project.progress=round(100*complete/total)
     phase_for={"design":"Design","product design":"Design","frontend":"Development","backend":"Development","development":"Development","content":"Optimisation & launch","seo":"Optimisation & launch","optimisation":"Optimisation & launch","optimization":"Optimisation & launch"}
     phase_order=["Design","Development","Optimisation & launch"]
@@ -1241,17 +1336,72 @@ def list_sprints(project_id:int,db:Session=Depends(get_db),user:User=Depends(cur
     if not project: raise HTTPException(404,"Project not found")
     if not can_view_project(db,project,user): raise HTTPException(403,"Not a member of this project")
     rows=db.scalars(select(Sprint).where(Sprint.project_id==project_id).order_by(Sprint.start_date)).all()
-    return [{"id":s.id,"project_id":s.project_id,"name":s.name,"start_date":s.start_date,"end_date":s.end_date,"status":s.status} for s in rows]
+    return [sprint_json(s) for s in rows]
+
+def sprint_json(sprint:Sprint):
+    return {"id":sprint.id,"project_id":sprint.project_id,"name":sprint.name,"start_date":sprint.start_date,"end_date":sprint.end_date,"status":sprint.status,"what_went_well":sprint.what_went_well or "","what_went_wrong":sprint.what_went_wrong or "","next_actions":sprint.next_actions or "","reviewed_at":sprint.reviewed_at}
 
 @app.post("/projects/{project_id}/sprints",status_code=201)
 def create_sprint(project_id:int,data:SprintIn,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
     project=db.get(Project,project_id)
     if not project: raise HTTPException(404,"Project not found")
-    if user.role=="employee" and (project.owner_id!=user.id or "product_owner" not in (user.tags or "").split(",")): raise HTTPException(403,"Only the tagged project owner can plan sprints")
+    if not can_manage_project_tasks(db,project,user): raise HTTPException(403,"Only an administrator, project owner, or project scrum master can plan sprints")
     if data.end_date<data.start_date: raise HTTPException(400,"Sprint end date must be on or after its start date")
     if db.scalar(select(Sprint).where(Sprint.project_id==project_id,Sprint.name==data.name.strip())): raise HTTPException(409,"A sprint with this name already exists")
     sprint=Sprint(project_id=project_id,name=data.name.strip(),start_date=data.start_date,end_date=data.end_date);db.add(sprint);db.commit();db.refresh(sprint)
-    return {"id":sprint.id,"project_id":sprint.project_id,"name":sprint.name,"start_date":sprint.start_date,"end_date":sprint.end_date,"status":sprint.status}
+    return sprint_json(sprint)
+
+@app.post("/projects/{project_id}/sprints/{sprint_id}/start")
+def start_sprint(project_id:int,sprint_id:int,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
+    project=db.get(Project,project_id)
+    sprint=db.get(Sprint,sprint_id)
+    if not project or not sprint or sprint.project_id!=project_id: raise HTTPException(404,"Sprint not found")
+    if not can_manage_project_tasks(db,project,user): raise HTTPException(403,"Only an administrator, project owner, or project scrum master can start sprints")
+    if sprint.status!="planned": raise HTTPException(409,"Only a planned sprint can be started")
+    if db.scalar(select(Sprint.id).where(Sprint.project_id==project_id,Sprint.status=="active")):
+        raise HTTPException(409,"Finish the active sprint before starting another sprint")
+    earlier=db.scalar(select(Sprint.id).where(
+        Sprint.project_id==project_id,Sprint.status!="completed",Sprint.id!=sprint_id,
+        or_(Sprint.start_date<sprint.start_date,
+            (Sprint.start_date==sprint.start_date)&(Sprint.id<sprint_id)),
+    ))
+    if earlier: raise HTTPException(409,"Complete earlier sprints before starting this sprint")
+    if not db.scalar(select(Contract.id).where(Contract.project_id==project_id,Contract.status.in_(["signed","approved_pending_signatures"]))):
+        raise HTTPException(409,"Approve or sign the project contract before starting a sprint")
+    sprint.status="active"
+    db.commit()
+    db.refresh(sprint)
+    return sprint_json(sprint)
+
+@app.patch("/projects/{project_id}/sprints/{sprint_id}/review")
+def review_sprint(project_id:int,sprint_id:int,data:SprintReviewIn,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
+    project=db.get(Project,project_id)
+    sprint=db.get(Sprint,sprint_id)
+    if not project or not sprint or sprint.project_id!=project_id: raise HTTPException(404,"Sprint not found")
+    if not can_manage_project_tasks(db,project,user): raise HTTPException(403,"Only an administrator, project owner, or project scrum master can review sprints")
+    if sprint.status not in {"active","completed"}: raise HTTPException(409,"Start this sprint before completing its review")
+    if data.delivery_date<sprint.start_date: raise HTTPException(400,"Sprint delivery date must be on or after its start date")
+    previous_end=sprint.end_date
+    extension=data.delivery_date-previous_end
+    sprint.what_went_well=data.what_went_well.strip()
+    sprint.what_went_wrong=data.what_went_wrong.strip()
+    sprint.next_actions=data.next_actions.strip()
+    sprint.end_date=data.delivery_date
+    sprint.status="completed"
+    sprint.reviewed_at=datetime.utcnow()
+    if extension.days>0:
+        upcoming=db.scalars(select(Sprint).where(
+            Sprint.project_id==project_id,
+            Sprint.id!=sprint_id,
+            Sprint.start_date>previous_end,
+            Sprint.status!="completed",
+        ).order_by(Sprint.start_date,Sprint.id)).all()
+        for later in upcoming:
+            later.start_date+=extension
+            later.end_date+=extension
+    db.commit()
+    all_sprints=db.scalars(select(Sprint).where(Sprint.project_id==project_id).order_by(Sprint.start_date,Sprint.id)).all()
+    return {**sprint_json(sprint),"sprints":[sprint_json(row) for row in all_sprints]}
 
 @app.patch("/tasks/{task_id}/sprint")
 def assign_task_sprint(task_id:int,data:TaskSprintIn,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
@@ -1264,6 +1414,7 @@ def assign_task_sprint(task_id:int,data:TaskSprintIn,db:Session=Depends(get_db),
         if not is_owner and not is_lead: raise HTTPException(403,"Only the project owner or team scrum master can plan this task")
     sprint=db.get(Sprint,data.sprint_id) if data.sprint_id is not None else None
     if data.sprint_id is not None and (not sprint or sprint.project_id!=task.project_id): raise HTTPException(400,"Sprint must belong to this task's project")
+    if sprint and sprint.status=="completed": raise HTTPException(409,"Tasks cannot be moved into a completed sprint")
     task.sprint_id=sprint.id if sprint else None;db.commit()
     return task_json(task)
 
@@ -1272,8 +1423,13 @@ def create_task(project_id:int,data:TaskIn,db:Session=Depends(get_db),user:User=
     project=db.get(Project,project_id)
     if not project: raise HTTPException(404,"Project not found")
     if project.setup_status!="approved": raise HTTPException(409,"Admin must approve the project setup before tasks can be assigned")
-    signed_contract=db.scalar(select(Contract).where(Contract.project_id==project_id,Contract.status=="signed"))
-    if not signed_contract: raise HTTPException(409,"The project contract must be approved and signed by the client and project owner before work starts")
+    contract_cleared=db.scalar(select(Contract.id).where(Contract.project_id==project_id,Contract.status.in_(["signed","approved_pending_signatures"]))) is not None
+    sprint=db.get(Sprint,data.sprint_id) if data.sprint_id is not None else None
+    if data.sprint_id is not None and (not sprint or sprint.project_id!=project_id): raise HTTPException(400,"Sprint must belong to this project")
+    if sprint and sprint.status=="completed": raise HTTPException(409,"Tasks cannot be added to a completed sprint")
+    work_unlocked=contract_cleared and (sprint is None or sprint.status=="active")
+    if data.project_step_id is not None and not contract_cleared:
+        raise HTTPException(409,"Approve or sign the project contract before assigning tasks to a roadmap stage")
     if user.role=="employee":
         is_owner=project.owner_id==user.id
         is_member=db.scalar(select(TeamMember.id).join(Team).where(Team.project_id==project_id,TeamMember.user_id==user.id,TeamMember.invitation_status=="accepted")) is not None
@@ -1288,34 +1444,74 @@ def create_task(project_id:int,data:TaskIn,db:Session=Depends(get_db),user:User=
         membership=db.scalar(select(TeamMember).where(TeamMember.team_id==data.team_id,TeamMember.user_id==assignee_id,TeamMember.invitation_status=="accepted"))
         if not membership: raise HTTPException(400,"Assignee must accept an invitation to this team")
         if has_active_task(db,assignee_id): raise HTTPException(409,"This teammate already has an active task")
-        status="in_progress"
-    elif data.team_id:
+        status="in_progress" if work_unlocked else "waiting"
+    elif data.team_id and work_unlocked:
         candidate=assignment_candidate(db,data.team_id,data.complexity)
         if candidate:
             assignee_id=candidate.id; status="in_progress"
-    if data.sprint_id is not None:
-        sprint=db.get(Sprint,data.sprint_id)
-        if not sprint or sprint.project_id!=project_id: raise HTTPException(400,"Sprint must belong to this project")
-    task=Task(project_id=project_id,team_id=data.team_id,title=data.title,description=data.description,priority=data.priority,complexity=data.complexity,story_points=data.story_points,assignee_id=assignee_id,status=status,due_date=data.due_date,sprint_id=data.sprint_id,ai_generated=data.ai_generated)
+    steps=db.scalars(select(ProjectStep).where(ProjectStep.project_id==project_id).order_by(ProjectStep.position)).all()
+    if data.project_step_id is not None and not any(step.id==data.project_step_id for step in steps):
+        raise HTTPException(400,"Delivery step must belong to this project")
+    step_id=data.project_step_id
+    position=db.scalar(select(func.count(Task.id)).where(Task.project_id==project_id,Task.status==status)) or 0
+    task=Task(project_id=project_id,team_id=data.team_id,title=data.title,description=data.description,priority=data.priority,complexity=data.complexity,story_points=data.story_points,estimated_hours=data.estimated_hours,assignee_id=assignee_id,status=status,due_date=data.due_date,sprint_id=data.sprint_id,project_step_id=step_id,position=position,ai_generated=data.ai_generated)
     db.add(task); db.flush(); sync_project_progress(db,project_id); db.commit(); db.refresh(task)
     return task_json(task)
 
 @app.get("/projects/{project_id}/tasks")
-def list_tasks(project_id:int,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
+def list_tasks(project_id:int,db:Session=Depends(get_db),user:User=Depends(current_user)):
     project=db.get(Project,project_id)
     if not project: raise HTTPException(404,"Project not found")
-    if user.role=="employee" and not can_view_project(db,project,user): raise HTTPException(403,"Not a member of this project")
-    return [task_json(t) for t in db.scalars(select(Task).where(Task.project_id==project_id).order_by(Task.created_at.desc())).all()]
+    if not can_view_project(db,project,user): raise HTTPException(403,"Not a member of this project")
+    rows=db.scalars(select(Task).where(Task.project_id==project_id).order_by(Task.status,Task.position,Task.created_at,Task.id)).all()
+    if user.role=="client":
+        client_tasks=[]
+        for task in rows:
+            assignee=db.get(User,task.assignee_id) if task.assignee_id else None
+            client_tasks.append({"id":task.id,"project_id":task.project_id,"title":task.title,"status":task.status,
+                                 "story_points":task.story_points,"estimated_hours":task.estimated_hours,
+                                 "assignee_id":task.assignee_id,"assignee_name":assignee.name if assignee else None,
+                                 "sprint_id":task.sprint_id,"project_step_id":task.project_step_id,
+                                 "due_date":task.due_date,"completed_at":task.completed_at})
+        return client_tasks
+    return [task_json(task) for task in rows]
+
+@app.patch("/tasks/{task_id}")
+def update_task(task_id:int,data:TaskUpdateIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    task=db.get(Task,task_id)
+    if not task: raise HTTPException(404,"Task not found")
+    project=db.get(Project,task.project_id)
+    if not project or not (can_manage_project_tasks(db,project,user) or user.role=="employee" and task.assignee_id==user.id):
+        raise HTTPException(403,"Only an administrator, project owner, scrum master, or task assignee can edit this task")
+    updates=data.model_dump(exclude_unset=True)
+    if "priority" in updates and updates["priority"] not in {"low","medium","high"}:
+        raise HTTPException(400,"Priority must be low, medium, or high")
+    if "complexity" in updates and updates["complexity"] not in {"simple","standard","complex"}:
+        raise HTTPException(400,"Complexity must be simple, standard, or complex")
+    for field,value in updates.items():
+        setattr(task,field,value)
+    db.flush()
+    sync_project_progress(db,task.project_id)
+    db.commit()
+    db.refresh(task)
+    return task_json(task)
 
 @app.patch("/tasks/{task_id}/status")
-def update_task_status(task_id:int,status:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
+def update_task_status(task_id:int,status:str,position:int|None=None,db:Session=Depends(get_db),user:User=Depends(current_user)):
     task=db.scalar(select(Task).where(Task.id==task_id).with_for_update())
     if not task: raise HTTPException(404,"Task not found")
     if user.role=="client": raise HTTPException(403,"Clients cannot change task status")
-    if user.role=="employee" and task.assignee_id!=user.id: raise HTTPException(403,"Only the assignee can update this task")
+    project=db.get(Project,task.project_id)
+    if user.role=="employee" and task.assignee_id!=user.id and not can_manage_project_tasks(db,project,user): raise HTTPException(403,"Only the assignee, project owner, or project scrum master can update this task")
     if status=="in_progress" and task.assignee_id and has_active_task(db,task.assignee_id,task.id): raise HTTPException(409,"One active task per teammate")
     if status not in {"waiting","in_progress","in_review","done"}:
         raise HTTPException(400,"Status must be waiting, in_progress, in_review, or done")
+    if task.sprint_id:
+        sprint=db.get(Sprint,task.sprint_id)
+        if not sprint or sprint.status!="active":
+            raise HTTPException(409,"Start this sprint before changing task status")
+    if status in {"in_progress","in_review","done"} and not db.scalar(select(Contract.id).where(Contract.project_id==task.project_id,Contract.status.in_(["signed","approved_pending_signatures"]))):
+        raise HTTPException(409,"Tasks cannot start until the project contract is approved or signed")
     if status=="done" and not task.completion_rewarded and task.assignee_id:
         assignee=db.get(User,task.assignee_id)
         if assignee:
@@ -1323,15 +1519,43 @@ def update_task_status(task_id:int,status:str,db:Session=Depends(get_db),user:Us
             reward={"simple":10,"standard":20,"complex":35}.get(task.complexity,15)
             assignee.experience_points+=reward
             assignee.level=1+assignee.experience_points//100
-    task.status=status; db.flush(); sync_project_progress(db,task.project_id); db.commit(); return task_json(task)
+    if status=="done":
+        if task.status!="done" or task.completed_at is None:
+            task.completed_at=datetime.utcnow()
+    else:
+        task.completed_at=None
+    reorder_task(db,task,status,position)
+    db.flush(); sync_project_progress(db,task.project_id); db.commit(); return task_json(task)
+
+@app.patch("/tasks/{task_id}/workflow")
+def update_task_workflow(task_id:int,data:TaskWorkflowIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    task=db.get(Task,task_id)
+    if not task: raise HTTPException(404,"Task not found")
+    project=db.get(Project,task.project_id)
+    can_manage=bool(project and can_manage_project_tasks(db,project,user))
+    is_assignee=user.role=="employee" and task.assignee_id==user.id
+    if not project or not (can_manage or is_assignee): raise HTTPException(403,"Only an administrator, project owner, project scrum master, or task assignee can edit this workflow")
+    if is_assignee and not can_manage and data.project_step_id!=task.project_step_id:
+        raise HTTPException(403,"Only an administrator, project owner, or project scrum master can change roadmap stages")
+    if task.sprint_id and data.project_step_id!=task.project_step_id and not db.scalar(select(Contract.id).where(Contract.project_id==task.project_id,Contract.status.in_(["signed","approved_pending_signatures"]))):
+        raise HTTPException(409,"Sprint tasks cannot be moved into roadmap stages until the project contract is approved or signed")
+    if data.project_step_id is not None:
+        step=db.get(ProjectStep,data.project_step_id)
+        if not step or step.project_id!=task.project_id: raise HTTPException(400,"Delivery step must belong to this project")
+    if task.id in data.trigger_task_ids or len(set(data.trigger_task_ids))!=len(data.trigger_task_ids):
+        raise HTTPException(400,"Choose unique trigger tasks other than this task")
+    triggers=db.scalars(select(Task).where(Task.id.in_(data.trigger_task_ids),Task.project_id==task.project_id)).all() if data.trigger_task_ids else []
+    if len(triggers)!=len(data.trigger_task_ids): raise HTTPException(400,"Every trigger task must belong to this project")
+    task.project_step_id=data.project_step_id
+    task.trigger_task_ids_json=json.dumps(data.trigger_task_ids)
+    db.commit()
+    return task_json(task)
 
 @app.post("/projects/{project_id}/tasks/generate")
 def generate_tasks(project_id:int,scope:str,db:Session=Depends(get_db),user:User=Depends(require_roles("admin","employee"))):
     project=db.get(Project,project_id)
     if not project: raise HTTPException(404,"Project not found")
     if project.setup_status!="approved": raise HTTPException(409,"Project setup must be approved first")
-    if not db.scalar(select(Contract).where(Contract.project_id==project_id,Contract.status=="signed")):
-        raise HTTPException(409,"The project contract must be signed before generating project tasks")
     # Conservative proposal extraction; generated rows stay unassigned in the waiting list for owner review.
     if len(scope)>12000: raise HTTPException(413,"Task generation scope must be 12,000 characters or less")
     chunks=[x.strip(" -*•\t") for x in re.split(r"[\n.;]",scope) if len(x.strip())>2]

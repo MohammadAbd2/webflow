@@ -1,5 +1,5 @@
 from datetime import datetime, date
-from sqlalchemy import String, Integer, DateTime, Date, Boolean, ForeignKey, Text, Enum, UniqueConstraint
+from sqlalchemy import String, Integer, DateTime, Date, Boolean, ForeignKey, Text, Enum, UniqueConstraint, Float
 from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
@@ -138,6 +138,10 @@ class Sprint(Base):
     start_date: Mapped[date] = mapped_column(Date)
     end_date: Mapped[date] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(30), default="planned")
+    what_went_well: Mapped[str] = mapped_column(Text, default="")
+    what_went_wrong: Mapped[str] = mapped_column(Text, default="")
+    next_actions: Mapped[str] = mapped_column(Text, default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -150,11 +154,16 @@ class Task(Base):
     priority: Mapped[str] = mapped_column(String(20), default="medium")
     complexity: Mapped[str] = mapped_column(String(20), default="standard")
     story_points: Mapped[int] = mapped_column(Integer, default=1)
+    estimated_hours: Mapped[float] = mapped_column(Float, default=4.0)
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     sprint_id: Mapped[int | None] = mapped_column(ForeignKey("sprints.id", ondelete="SET NULL"), nullable=True)
+    project_step_id: Mapped[int | None] = mapped_column(ForeignKey("project_steps.id", ondelete="SET NULL"), nullable=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    trigger_task_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     completion_rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
     ai_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 class CancellationRequest(Base):

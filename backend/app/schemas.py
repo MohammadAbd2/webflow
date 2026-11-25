@@ -110,6 +110,12 @@ class SprintIn(BaseModel):
     start_date: date
     end_date: date
 
+class SprintReviewIn(BaseModel):
+    what_went_well: str = Field(default="", max_length=4000)
+    what_went_wrong: str = Field(default="", max_length=4000)
+    next_actions: str = Field(default="", max_length=4000)
+    delivery_date: date
+
 class TaskSprintIn(BaseModel):
     sprint_id: int | None = None
 
@@ -120,10 +126,27 @@ class TaskIn(BaseModel):
     priority: str = "medium"
     complexity: str = "standard"
     story_points: int = 1
+    estimated_hours: float = Field(default=4, gt=0, le=10000)
     assignee_id: int | None = None
     due_date: date | None = None
     sprint_id: int | None = None
+    project_step_id: int | None = None
     ai_generated: bool = False
+
+class TaskUpdateIn(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=240)
+    description: str | None = Field(default=None, max_length=12000)
+    priority: str | None = None
+    complexity: str | None = None
+    story_points: int | None = Field(default=None, ge=0, le=1000)
+    estimated_hours: float | None = Field(default=None, gt=0, le=10000)
+    due_date: date | None = None
+    team_id: int | None = None
+    assignee_id: int | None = None
+
+class TaskWorkflowIn(BaseModel):
+    project_step_id: int | None = None
+    trigger_task_ids: list[int] = Field(default_factory=list, max_length=50)
 
 class DecisionIn(BaseModel):
     accept: bool
@@ -152,6 +175,9 @@ class NotificationReadIn(BaseModel):
 
 class UserStatusIn(BaseModel):
     active: bool
+
+class AdminExperiencePointsIn(BaseModel):
+    delta: int = Field(ge=-1000000, le=1000000)
 
 class UserRoleIn(BaseModel):
     role: str
